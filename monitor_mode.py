@@ -165,10 +165,10 @@ class MonitorMode(Mode):
 
         draw.line([0, 100, W, 100], fill=COLORS["accent"], width=1)
 
-        # 容器列表表头
+        # 容器列表表头（name 列加宽，status 列居中）
         y = DOCKER_HEADER_Y
         draw.text((8, y), "CONTAINER", font=f_small, fill=COLORS["gray"])
-        draw.text((150, y), "STATUS", font=f_small, fill=COLORS["gray"])
+        draw.text((175, y), "STATUS", font=f_small, fill=COLORS["gray"])
         draw.text((360, y), "STATE", font=f_small, fill=COLORS["gray"])
 
         # 底部状态栏
@@ -216,7 +216,7 @@ class MonitorMode(Mode):
             else:
                 color = COLORS["yellow"]
             draw.text((8, y), name, font=f_tiny, fill=COLORS["white"])
-            draw.text((150, y), status, font=f_tiny, fill=COLORS["gray"])
+            draw.text((175, y), status, font=f_tiny, fill=COLORS["gray"])
             draw.text((360, y), state, font=f_tiny, fill=color)
             y += DOCKER_LINE_HEIGHT
 

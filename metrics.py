@@ -164,7 +164,7 @@ def read_docker_containers() -> List[Tuple[str, str, str]]:
         if len(parts) != 3:
             continue
         name, status, state = parts
-        containers.append((name[:14], status[:28], state))
+        containers.append((name[:18], status[:40], state))
     return containers
 
 
