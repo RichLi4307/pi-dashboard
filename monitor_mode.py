@@ -77,16 +77,16 @@ class MonitorMode(Mode):
     def collect_fast_data(self) -> None:
         # 快速路径：/proc、/sys 纯文件读取，每帧可安全执行
         self.now = datetime.now().strftime("%H:%M:%S")
-        self.temp = _read_cpu_temp()
+        self.temp = read_cpu_temp()
         self.cpu = self._cpu_sampler.read()
-        self.mem = _read_mem_info()
-        self.disk = _read_disk_usage()
+        self.mem = read_mem_info()
+        self.disk = read_disk_usage()
 
     def collect_slow_data(self) -> None:
         # 慢速路径：涉及子进程 / 网络，降低频率避免拖垮帧率
-        self.ip_list = _get_ip_list()
-        self.containers = _read_docker_containers()
-        self.tailscale = _read_tailscale_status()
+        self.ip_list = get_ip_list()
+        self.containers = read_docker_containers()
+        self.tailscale = read_tailscale_status()
 
     def on_tick(self) -> None:
         now = time.monotonic()
