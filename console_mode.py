@@ -20,10 +20,10 @@ from .touch import TouchEvent
 
 logger = logging.getLogger("pi_dashboard.console")
 
-CONSOLE_BG = "#0a0a0a"
-CONSOLE_GREEN = "#00ff66"
-CONSOLE_WHITE = "#cccccc"
-CONSOLE_GRAY = "#555555"
+CONSOLE_BG = "#0d1117"      # GitHub Dark canvas-default
+CONSOLE_GREEN = "#3fb950"   # success-fg
+CONSOLE_WHITE = "#e6edf3"   # fg-default
+CONSOLE_GRAY = "#7d8590"    # fg-muted
 STATUS_BAR_H = 18
 FOOTER_H = 20
 FONT_SIZE = 12
@@ -365,7 +365,7 @@ class ConsoleMode(Mode):
         draw = ImageDraw.Draw(img)
         font = get_font(FONT_SIZE, mono=True)
 
-        draw.rectangle([0, 0, W, STATUS_BAR_H], fill="#111111")
+        draw.rectangle([0, 0, W, STATUS_BAR_H], fill="#161b22")
         # 标题 "CONSOLE" 靠左对齐，避免与右上角按钮重叠
         draw.text((6, 2), "CONSOLE", font=font, fill=CONSOLE_GREEN)
 
@@ -374,7 +374,7 @@ class ConsoleMode(Mode):
         # 触摸区域在 panel.py 中定义，范围大于可视区域以便点击
         btn_x = W - SWITCH_HOTZONE_SIZE
         # 绘制按钮背景：蓝色矩形 + 边框
-        draw.rectangle([btn_x, 2, W, STATUS_BAR_H - 2], fill="#1e3a5f", outline="#333333")
+        draw.rectangle([btn_x, 2, W, STATUS_BAR_H - 2], fill="#21262d", outline="#30363d")
         # 绘制按钮文字：黄色 "MONITOR"，水平居中于按钮区域
         btn_text = "MONITOR"
         btn_tw = draw.textbbox((0, 0), btn_text, font=font)[2]
@@ -392,7 +392,7 @@ class ConsoleMode(Mode):
                 draw.text((hostname_x, 2), hn, font=font, fill=CONSOLE_GRAY)
         except Exception:
             pass
-        draw.rectangle([0, STATUS_BAR_H, W, STATUS_BAR_H], fill="#333333", width=1)
+        draw.rectangle([0, STATUS_BAR_H, W, STATUS_BAR_H], fill="#30363d", width=1)
 
         with self._lock:
             # 保留一行空间给当前尚未换行的输入缓冲
@@ -409,7 +409,7 @@ class ConsoleMode(Mode):
             prompt = current_input[-self.COLS:]
             draw.text((6, y), prompt, font=font, fill=CONSOLE_WHITE)
 
-        draw.rectangle([0, H - 20, W, H], fill="#111111")
+        draw.rectangle([0, H - 20, W, H], fill="#161b22")
         draw.text((110, H - 18), "Powered by RichLi4307", font=font, fill=CONSOLE_GRAY)
 
         return img

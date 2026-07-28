@@ -7,10 +7,44 @@ import time
 import numpy as np
 from PIL import Image, ImageDraw
 
-from .config import COLORS, FB, W, H
+from .config import COLORS, FB, TEMP_GRADIENT, TEMP_RANGE, USAGE_GRADIENT, W, H
 from .fonts import get_font
 
 logger = logging.getLogger("pi_dashboard.render")
+
+
+def gradient_color(ratio: float, stops: list[tuple[float, str]]) -> str:
+    """按 0~1 比例在多段色标间线性插值，返回 #rrggbb。
+
+    stops 为 [(位置, 颜色), ...]，位置单调递增且覆盖 0 和 1。
+    只在模块加载时用于构建查找表，运行期渲染直接查表，零计算开销。
+    """
+    ratio = max(0.0, min(1.0, ratio))
+    prev_pos, prev_hex = stops[0]
+    for pos, hexs in stops[1:]:
+        if ratio <= pos:
+            if pos <= prev_pos:
+                return hexs
+            t = (ratio - prev_pos) / (pos - prev_pos)
+            r0, g0, b0 = (int(prev_hex[i:i + 2], 16) for i in (1, 3, 5))
+            r1, g1, b1 = (int(hexs[i:i + 2], 16) for i in (1, 3, 5))
+            r = int(r0 + (r1 - r0) * t)
+            g = int(g0 + (g1 - g0) * t)
+            b = int(b0 + (b1 - b0) * t)
+            return f"#{r:02x}{g:02x}{b:02x}"
+        prev_pos, prev_hex = pos, hexs
+    return stops[-1][1]
+
+
+# 预插值查找表：加载时一次算好，运行期只做一次列表索引，不给 ARM 小核添负担
+# 用量百分比 0~100% → 颜色（CPU 条 / 内存 / 磁盘共用）
+USAGE_COLOR_LUT = [gradient_color(p / 100.0, USAGE_GRADIENT) for p in range(101)]
+# 温度 0~127°C → 颜色（超出范围钳位到端点色）
+_temp_lo, _temp_hi = TEMP_RANGE
+TEMP_COLOR_LUT = [
+    gradient_color((t - _temp_lo) / (_temp_hi - _temp_lo), TEMP_GRADIENT)
+    for t in range(128)
+]
 
 
 def blit(img: Image.Image) -> None:

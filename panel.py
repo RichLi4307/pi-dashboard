@@ -150,7 +150,6 @@ class Panel:
                     except Exception as exc:
                         logger.exception("Mode render failed for %s", self.active_mode)
                         try:
-                            from .render import render_boot_screen
                             blit(render_boot_screen())
                         except Exception:
                             logger.exception("Failed to render fallback screen")
