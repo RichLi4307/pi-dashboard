@@ -17,11 +17,12 @@ import threading
 import time
 from typing import Any
 
+from .metrics import get_ip_list, read_tailscale_status
 from .touch import TouchEvent
 
 logger = logging.getLogger("pi_dashboard.ipc")
 
-DEFAULT_SOCKET_PATH = "/run/pi_dashboard/pi_dashboard.sock"
+DEFAULT_SOCKET_PATH = "/var/lib/pi-dashboard/pi_dashboard.sock"
 
 
 class IpcServer:
@@ -141,12 +142,26 @@ class IpcServer:
         action = request.get("action")
         if action == "screenshot":
             return self._handle_screenshot()
+        if action == "status":
+            return self._handle_status()
         if action == "switch_mode":
             mode = request.get("mode", "monitor")
             return self._handle_switch_mode(mode)
         if action == "scroll_containers":
             return self._handle_scroll_containers()
         return {"status": "error", "message": f"unknown action: {action}"}
+
+    def _handle_status(self) -> dict[str, Any]:
+        """返回宿主机视角的 IP 与 Tailscale 状态，供容器内的 MCP 使用。"""
+        try:
+            return {
+                "status": "ok",
+                "ips": get_ip_list(),
+                "tailscale": read_tailscale_status(),
+            }
+        except Exception as exc:
+            logger.exception("Status request failed")
+            return {"status": "error", "message": str(exc)}
 
     def _handle_screenshot(self) -> dict[str, Any]:
         try:
