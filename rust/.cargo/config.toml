@@ -1,0 +1,8 @@
+# Cross-compilation configuration for building on x86 for the Pi 4B (aarch64).
+# Run: cargo build --release --target aarch64-unknown-linux-gnu
+#
+# The linker path below assumes a standard aarch64-linux-gnu-gcc cross toolchain.
+# Adjust or remove this file if building directly on the Pi.
+
+[target.aarch64-unknown-linux-gnu]
+linker = "aarch64-linux-gnu-gcc"
