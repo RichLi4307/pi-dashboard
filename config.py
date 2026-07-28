@@ -53,10 +53,10 @@ MONO_FONT_PATHS = [
     "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
 ]
 
-REFRESH_INTERVAL = 0.2  # CPU 占用条刷新率 5 FPS
-SLOW_RENDER_INTERVAL = 2.0  # 时间/温度/内存/磁盘/IP/容器等慢变内容刷新率 0.5 FPS
-SLOW_DATA_INTERVAL = 2.0  # Docker / Tailscale / IP 等慢速数据更新间隔
-CPU_SMOOTH_WINDOW = 5  # CPU 占用滑动平均窗口，保证高刷新下读数稳定
+REFRESH_INTERVAL = 0.1          # 10 FPS：在流畅度与功耗/撕裂间折中
+SLOW_RENDER_INTERVAL = 1.0      # 慢变内容 1 FPS
+SLOW_DATA_INTERVAL = 2.0
+CPU_SMOOTH_WINDOW = 10
 BOOT_TIMEOUT = 30
 
 MODE_NAMES = ["monitor", "console"]
