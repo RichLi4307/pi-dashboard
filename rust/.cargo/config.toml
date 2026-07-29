@@ -1,8 +1,13 @@
-# Cross-compilation configuration for building on x86 for the Pi 4B (aarch64).
-# Run: cargo build --release --target aarch64-unknown-linux-gnu
+# Cargo 构建配置
 #
-# The linker path below assumes a standard aarch64-linux-gnu-gcc cross toolchain.
-# Adjust or remove this file if building directly on the Pi.
-
+# 1) 交叉编译（备用）：在 x86 开发机上构建 aarch64 二进制。
+#    推荐直接在 Pi 上原生构建，此时本段不生效、可忽略。
 [target.aarch64-unknown-linux-gnu]
 linker = "aarch64-linux-gnu-gcc"
+
+# 2) crates.io 清华 sparse 镜像（校园网拉取慢时取消注释）：
+[source.crates-io]
+replace-with = "tuna"
+
+[source.tuna]
+registry = "sparse+https://mirrors.tuna.tsinghua.edu.cn/crates.io-index/"

@@ -1,0 +1,144 @@
+//! 2D drawing primitives.
+//!
+//! All drawing operates on the `Framebuffer` shadow buffer and marks dirty
+//! regions. RGB888 constants from `config.rs` are converted to RGB565 on write.
+//! Text rendering lives in `text.rs`.
+
+use crate::config::{H, W};
+use crate::fb::{Framebuffer, Rect};
+
+/// Convert 0xRRGGBB to RGB565 little-endian.
+pub fn rgb888_to_rgb565(c: u32) -> u16 {
+    let r = ((c >> 16) & 0xff) as u16;
+    let g = ((c >> 8) & 0xff) as u16;
+    let b = (c & 0xff) as u16;
+    ((r & 0xf8) << 8) | ((g & 0xfc) << 3) | (b >> 3)
+}
+
+/// Convert RGB565 to 0xRRGGBB.
+pub fn rgb565_to_rgb888(c: u16) -> u32 {
+    let r5 = (c >> 11) & 0x1f;
+    let g6 = (c >> 5) & 0x3f;
+    let b5 = c & 0x1f;
+    let r = (r5 << 3) | (r5 >> 2);
+    let g = (g6 << 2) | (g6 >> 4);
+    let b = (b5 << 3) | (b5 >> 2);
+    ((r as u32) << 16) | ((g as u32) << 8) | (b as u32)
+}
+
+/// Alpha blend `fg` (0xRRGGBB) over `bg` (0xRRGGBB), return 0xRRGGBB.
+pub fn blend_rgb888(bg: u32, fg: u32, alpha: u8) -> u32 {
+    if alpha == 0 {
+        return bg;
+    }
+    if alpha == 255 {
+        return fg;
+    }
+    let a = alpha as u32;
+    let inv = 255 - a;
+    let r = (((bg >> 16) & 0xff) * inv + ((fg >> 16) & 0xff) * a) / 255;
+    let g = (((bg >> 8) & 0xff) * inv + ((fg >> 8) & 0xff) * a) / 255;
+    let b = ((bg & 0xff) * inv + (fg & 0xff) * a) / 255;
+    (r << 16) | (g << 8) | b
+}
+
+/// Alpha blend `fg` over the RGB565 pixel `dst`, returning RGB565.
+pub fn blend_over_rgb565(dst: u16, fg: u32, alpha: u8) -> u16 {
+    if alpha == 0 {
+        return dst;
+    }
+    let bg = rgb565_to_rgb888(dst);
+    rgb888_to_rgb565(blend_rgb888(bg, fg, alpha))
+}
+
+/// Draw a filled rectangle in RGB888 color. Only changed rows are marked dirty.
+pub fn fill_rect(fb: &mut Framebuffer, x: i32, y: i32, w: i32, h: i32, color: u32) {
+    if w <= 0 || h <= 0 {
+        return;
+    }
+    let x1 = x.max(0) as usize;
+    let y1 = y.max(0) as usize;
+    let x2 = (x + w).min(W as i32) as usize;
+    let y2 = (y + h).min(H as i32) as usize;
+    if x1 >= x2 || y1 >= y2 {
+        return;
+    }
+    let rgb565 = rgb888_to_rgb565(color);
+    let mut changed = false;
+    let mut dirty_x1 = x2;
+    let mut dirty_x2 = x1;
+    let mut dirty_y1 = y2;
+    let mut dirty_y2 = y1;
+
+    for row in y1..y2 {
+        let start = row * W + x1;
+        let slice = &mut fb.buffer_mut()[start..start + (x2 - x1)];
+        // Fast path: if the whole row is already the target colour, skip.
+        if slice.iter().all(|&p| p == rgb565) {
+            continue;
+        }
+        changed = true;
+        dirty_y1 = dirty_y1.min(row);
+        dirty_y2 = dirty_y2.max(row + 1);
+        for (col, pixel) in slice.iter_mut().enumerate() {
+            let gx = x1 + col;
+            if *pixel != rgb565 {
+                *pixel = rgb565;
+                dirty_x1 = dirty_x1.min(gx);
+                dirty_x2 = dirty_x2.max(gx + 1);
+            }
+        }
+    }
+
+    if changed {
+        fb.mark_dirty(Rect::new(dirty_x1, dirty_y1, dirty_x2, dirty_y2));
+    }
+}
+
+/// Draw a horizontal line.
+pub fn draw_line_h(fb: &mut Framebuffer, x1: i32, x2: i32, y: i32, color: u32) {
+    if y < 0 || y >= H as i32 {
+        return;
+    }
+    let x1c = x1.max(0) as usize;
+    let x2c = (x2.min(W as i32) as usize).max(x1c);
+    let yc = y as usize;
+    let rgb565 = rgb888_to_rgb565(color);
+    let start = yc * W + x1c;
+    let slice = &mut fb.buffer_mut()[start..start + (x2c - x1c)];
+    if slice.iter().all(|&p| p == rgb565) {
+        return;
+    }
+    slice.fill(rgb565);
+    fb.mark_dirty(Rect::new(x1c, yc, x2c, yc + 1));
+}
+
+/// Draw a filled ellipse (circle) at `(cx,cy)` with radius `r`.
+pub fn fill_ellipse(fb: &mut Framebuffer, cx: i32, cy: i32, rx: i32, ry: i32, color: u32) {
+    if rx <= 0 || ry <= 0 {
+        return;
+    }
+    let rgb565 = rgb888_to_rgb565(color);
+    let x1 = (cx - rx).max(0) as usize;
+    let y1 = (cy - ry).max(0) as usize;
+    let x2 = (cx + rx + 1).min(W as i32) as usize;
+    let y2 = (cy + ry + 1).min(H as i32) as usize;
+    let rx2 = (rx * rx) as f32;
+    let ry2 = (ry * ry) as f32;
+    let mut changed = false;
+    for y in y1..y2 {
+        let dy = (y as i32 - cy) as f32;
+        let dx_max = (rx2 * (1.0 - dy * dy / ry2)).max(0.0).sqrt();
+        let xl = ((cx as f32 - dx_max).ceil() as i32).max(0) as usize;
+        let xr = ((cx as f32 + dx_max).floor() as i32 + 1).min(W as i32) as usize;
+        let start = y * W + xl;
+        let slice = &mut fb.buffer_mut()[start..start + (xr - xl)];
+        if !slice.iter().all(|&p| p == rgb565) {
+            slice.fill(rgb565);
+            changed = true;
+        }
+    }
+    if changed {
+        fb.mark_dirty(Rect::new(x1, y1, x2, y2));
+    }
+}
