@@ -12,3 +12,8 @@ __pycache__/
 # Runtime data / backups
 backups/
 *.log
+
+# Release artifacts
+release_assets/
+*.zip
+RELEASE_NOTES_*.md
