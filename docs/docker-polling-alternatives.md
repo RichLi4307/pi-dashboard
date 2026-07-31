@@ -14,64 +14,41 @@
 
 ---
 
-## 方案 1：Docker Engine REST API 替代 `docker ps` CLI（已实施）
+## 方案 1：Docker Engine REST API 替代 `docker ps` CLI（已评估并撤回）
 
 ### 思路
 不再 `fork/exec` `docker ps` 子进程，而是直接通过 `tokio::net::UnixStream` 连接 `/var/run/docker.sock`，发送 HTTP/1.1 `GET /containers/json?all=1`，解析 JSON 得到 name/state/id。
 
-### 实施状态
-- **代码位置**：`rust/src/metrics.rs:81-141`（API 辅助函数）、`rust/src/metrics.rs:476-497`（`read_docker_containers_with_cpu` 优先走 API）。
-- **部署时间**：2026-07-31。
-- **回退机制**：API 连接或解析失败时自动 fallback 到原 `docker ps` CLI，日志输出 `warn`；因此不会因为 API 临时不可用而导致面板容器列表为空。
+### 实施与撤回状态
+- **实施时间**：2026-07-31（commit `5bea557`）。
+- **撤回时间**：2026-07-31（紧随 120 秒验证之后）。
+- **代码位置**：已恢复为原 `docker ps` CLI 路径；相关 API 辅助函数已删除。
 
-### 优点
-- **消除 fork/exec 开销**：无需启动 docker CLI 进程，减少 containerd/dockerd 压力。
-- **权限现成**：`richli` 已在 docker 组。
-- **零新增系统依赖/零新增 crate**：纯 Rust + tokio，与现有技术栈一致。
-- **稳定性高**：Docker Engine API 是 Docker 官方接口，长期稳定。
-- **实测收益**：`docker ps` CLI 进程从周期性出现变为几乎消失；dockerd/containerd 峰值进一步下降。
+### 实测结论（撤回原因）
 
-### 缺点
-- 仍经过 dockerd，无法彻底消除 dockerd 尖峰（剩余尖峰主要来自 `docker stats` / cgroup 枚举之外的 dockerd 内部工作）。
-- 手写极简 HTTP/1.1 client，需要小心处理 header/body 切分；当前实现使用 `Connection: close`，不维护 keep-alive，换取简单可靠。
+在 `SLOW_DATA_INTERVAL=5.0s` + cgroup v2 CPU 采样的基础上，分别用 60s 和 120s `pidstat` 采样对比：
 
-### 实现要点
-```rust
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::UnixStream;
-
-async fn docker_api_get(path: &str) -> Option<String> {
-    let mut stream = UnixStream::connect("/var/run/docker.sock").await.ok()?;
-    let req = format!(
-        "GET {} HTTP/1.1\r\nHost: docker\r\nConnection: close\r\n\r\n",
-        path
-    );
-    stream.write_all(req.as_bytes()).await.ok()?;
-    // read until EOF, split headers/body at \r\n\r\n
-}
-```
-
-### 运行约束
-1. **用户权限**：运行面板的用户必须在 `docker` 组，且 `/var/run/docker.sock` 属 `root:docker`、权限 `660`。
-2. **Docker 版本**：依赖 Docker Engine API v1.x 的 `/containers/json?all=1`，字段为 `Id`、`Names`、`State`、`Status`；当前 Docker 29.1.3 兼容。
-3. **短连接**：每次刷新新建 unix socket 连接，不 keep-alive；在 5 秒刷新周期下开销可忽略，且避免连接断线导致 stale 数据。
-4. **保留 CLI fallback**：删除/改动 `docker` 组权限、Docker socket 路径或 Docker 版本不兼容时，面板会自动回退到 `docker ps`，不会崩溃。
-
-### 实测效果（2026-07-31，SLOW_DATA_INTERVAL=5.0s）
-
-系统级 `pidstat 1 60` 采样对比：
-
-| 指标 | API 前（5s + cgroup，仍用 `docker ps`） | API 后（5s + cgroup + Docker API） |
+| 指标 | 用 `docker ps` CLI | 用 Docker Engine API |
 |---|---|---|
-| `docker` CLI 出现次数/平均 | 周期性 / ~5.1% | 仅 9 次采样 / 5.33%（非面板触发） |
-| `dockerd` 平均/最大 | ~14% / 26% | **20.35% / 45%*** |
-| `containerd` 平均/最大 | ~17.6% / 25% | **23.68% / 46%*** |
-| `pi-dashboard-ru` 平均/最大 | ~2% / 4% | **2.26% / 4%** |
+| `docker` CLI 出现 | 周期性出现 | 几乎不出现 |
+| `dockerd` 平均/最大 | ~24% / 66% | ~24% / 66% |
+| `containerd` 平均/最大 | ~29% / 63% | ~29% / 63% |
+| `pi-dashboard-ru` 平均/最大 | ~2.3% / 4% | ~2.3% / 4% |
+| 周期 | 5s | 5s |
 
-\* 采样期间 `kimi-code` Agent 自身占用 ~31% CPU，且存在 AstrBot 群聊消息等并发负载，因此 dockerd/containerd 绝对值不具备严格 A/B 对比意义；核心结论是 **`docker ps` CLI 周期性负载已被消除**。
+**核心发现**：
+- `docker ps` CLI 进程确实被消除了。
+- 但 `dockerd`/`containerd` 的 5 秒周期尖峰**没有明显下降**，说明主要瓶颈不是 CLI 的 fork/exec 开销，而是 dockerd 处理容器状态遍历本身。
+- 在 5 秒刷新周期下，fork/exec 一个 `docker` 进程的开销极小，不值得为此引入额外代码路径。
+
+### 撤回理由
+1. **收益不显著**：dockerd/containerd 负载未明显下降。
+2. **增加维护面**：手写 HTTP/1.1 解析、Docker API 字段依赖、fallback 路径都会成为未来故障点。
+3. **纪律冲突**：本次优化虽零新增 crate，但引入了非必要的实现复杂度。
+4. **当前方案已足够**：`SLOW_DATA_INTERVAL=5.0s` + cgroup v2 已经让面板自身负载很低（~2.3%），dockerd/containerd 波动是系统级 Docker 行为，不是面板核心优化目标。
 
 ### 风险
-**低**。接口稳定，权限已具备，改动范围小，失败自动 fallback。
+**低（已撤回）**。代码恢复为经过长期验证的 `docker ps` CLI 路径。
 
 ---
 
