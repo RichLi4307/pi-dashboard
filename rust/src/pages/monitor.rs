@@ -75,9 +75,9 @@ impl MonitorPage {
         let title_style = TextStyle::new(16, WHITE, false);
         let small_style = TextStyle::new(11, GRAY, false);
         let text_style = TextStyle::new(13, WHITE, false);
-        // Docker list uses Regular at 10 px: Medium's 'm' strokes blur together
-        // on the 480×320 panel; Light is too faint at this size.
-        let tiny_style = TextStyle::new(10, WHITE, false).with_weight(FontWeight::Regular);
+        // Docker list uses Regular at 11 px: size 10 makes strokes like 'm'
+        // collapse into a blob on the 480×320 panel regardless of weight.
+        let tiny_style = TextStyle::new(11, WHITE, false).with_weight(FontWeight::Regular);
 
         let host_label = Label::new(8, 6, host_style, Align::Left, PANEL, &fonts);
         // Time x will be recomputed on first render.
@@ -113,14 +113,14 @@ impl MonitorPage {
             let y = DOCKER_LIST_Y + i as i32 * DOCKER_LINE_HEIGHT;
             container_rows.push(ContainerRow {
                 name: Label::new(20, y, tiny_style, Align::Left, BG, &fonts),
-                status: Label::new(175, y, TextStyle::new(10, GRAY, false).with_weight(FontWeight::Regular), Align::Left, BG, &fonts),
+                status: Label::new(175, y, TextStyle::new(11, GRAY, false).with_weight(FontWeight::Regular), Align::Left, BG, &fonts),
                 state: Label::new(360, y, tiny_style, Align::Left, BG, &fonts),
             });
         }
 
         let page_label = Label::new(420, DOCKER_LIST_Y, TextStyle::new(11, YELLOW, false), Align::Left, BG, &fonts);
-        let footer_label = Label::new(8, config::H as i32 - 18, TextStyle::new(10, GRAY, false), Align::Left, PANEL, &fonts);
-        let fps_label = Label::new(340, config::H as i32 - 18, TextStyle::new(10, GRAY, false), Align::Left, PANEL, &fonts);
+        let footer_label = Label::new(8, config::H as i32 - 18, TextStyle::new(11, GRAY, false).with_weight(FontWeight::Regular), Align::Left, PANEL, &fonts);
+        let fps_label = Label::new(340, config::H as i32 - 18, TextStyle::new(11, GRAY, false).with_weight(FontWeight::Regular), Align::Left, PANEL, &fonts);
 
         Self {
             fonts,

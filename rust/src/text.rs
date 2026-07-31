@@ -437,8 +437,8 @@ mod tests {
             }
 
             let (recommended, note): (&str, &str) = match size {
-                10 => ("Regular", "minimum readable; Medium blurs 'm', Light too faint"),
-                11 => ("Regular", "readable, still compact; Medium acceptable"),
+                10 => ("Regular", "avoid: 'm' strokes collapse to a blob on 480x320"),
+                11 => ("Regular", "minimum usable small size; 'm' strokes separable"),
                 13 => ("Medium", "current default; good balance"),
                 16 => ("Medium", "headers, plenty of pixels"),
                 _ => (best.0, "auto"),
