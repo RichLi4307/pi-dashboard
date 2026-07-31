@@ -2,7 +2,7 @@
 
 树莓派 4B + 微雪 3.5 寸 TFT 屏的系统仪表盘。开机自启，实时显示 CPU、温度、内存、磁盘、IP、Docker 容器、Tailscale 状态，并支持通过触摸屏翻页容器列表。
 
-> **当前实现为 Rust 二进制**（原 Python 实现已归档到 `backups/python-legacy/`）。
+> **当前版本：v0.2.1**（Rust 二进制；原 Python 实现已归档到 `backups/python-legacy/`）。
 
 ## 功能特性
 
@@ -37,6 +37,9 @@
 │   ├── src/screenshot.rs  # RGB565 → PNG
 │   └── Cargo.toml
 ├── docs/                  # 设计文档与报告
+│   ├── ui-visual-language-spec.md   # v2 视觉语言规范
+│   ├── ui-visual-spec-v3.md         # v3 细节修正包
+│   └── ui-visual-spec-v3-report.md  # v3 实施报告
 ├── backups/               # 配置与旧 Python 实现备份
 └── README.md
 ```
@@ -109,7 +112,7 @@ sudo systemctl enable --now pi-dashboard.service
 | `REFRESH_INTERVAL_MS` | 67 | 主循环帧间隔（约 15 FPS）|
 | `CPU_SMOOTH_WINDOW` | 5 | CPU 占用滑动平均窗口 |
 | `SLOW_RENDER_INTERVAL` | 1.0 | 慢变内容刷新间隔（秒）|
-| `CONTAINER_PAGE_SIZE` | 10 | 容器列表每页行数 |
+| `CONTAINER_PAGE_SIZE` | 8 | 容器列表每页行数 |
 
 ## 调试
 
@@ -134,9 +137,10 @@ sudo journalctl -u pi-dashboard.service -f
 
 ## 性能数据
 
-- Rust 版 + 48 MHz SPI + 15 FPS：面板进程 CPU 约 1.8%，内存约 13 MB
-- 渲染层整改后：无脏区帧零 SPI 写入，10 帧 screenshot diff 无残影跳动
-- 详见 `docs/rust-render-rework-report.md`
+- Rust 版 + 48 MHz SPI + 15 FPS：面板进程 CPU 约 1.7–2.3%，内存约 11–13 MB
+- 渲染层整改后：无脏区帧零 SPI 写入，多帧 screenshot diff 无残影跳动
+- v3 UI 修正后：`pidstat 1 30` 平均 **1.69%** / 最大 **3.00%**
+- 详见 `docs/rust-render-rework-report.md` 与 `docs/ui-visual-spec-v3-report.md`
 
 ## 故障排查
 
