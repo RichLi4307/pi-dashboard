@@ -110,6 +110,28 @@ pub const IP_FILTER_ENABLED: bool = true;
 pub const SOCKET_PATH: &str = "/var/lib/pi-dashboard/pi_dashboard.sock";
 
 // ---------------------------------------------------------------------------
+// Hostname, resolved once at startup.
+// Priority: PI_DASHBOARD_HOSTNAME env → /etc/hostname → "pi"
+// ---------------------------------------------------------------------------
+pub static HOSTNAME: LazyLock<String> = LazyLock::new(|| {
+    if let Ok(v) = std::env::var("PI_DASHBOARD_HOSTNAME") {
+        if !v.is_empty() {
+            return v.trim().to_string();
+        }
+    }
+    std::fs::read_to_string("/etc/hostname")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "pi".to_string())
+});
+
+/// Return the cached hostname.
+pub fn hostname() -> &'static str {
+    &HOSTNAME
+}
+
+// ---------------------------------------------------------------------------
 // Lookup tables, built lazily on first use.
 // ---------------------------------------------------------------------------
 pub static USAGE_COLOR_LUT: LazyLock<[u32; 101]> = LazyLock::new(|| {
@@ -248,5 +270,20 @@ mod tests {
         assert_eq!(usage_text_color(89), CAUTION);
         assert_eq!(usage_text_color(90), ALARM);
         assert_eq!(usage_text_color(100), ALARM);
+    }
+
+    #[test]
+    fn hostname_fallback_chain() {
+        let h = hostname();
+        assert!(!h.is_empty());
+        // Should not be the fallback literal unless /etc/hostname is missing/empty.
+        if std::path::Path::new("/etc/hostname").exists() {
+            assert!(
+                h != "pi" || std::fs::read_to_string("/etc/hostname")
+                    .map(|s| s.trim().is_empty())
+                    .unwrap_or(true),
+                "hostname should come from /etc/hostname when present"
+            );
+        }
     }
 }

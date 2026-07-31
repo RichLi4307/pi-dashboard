@@ -145,6 +145,11 @@ impl Label {
     pub fn baseline_y(&self) -> i32 {
         self.baseline_y
     }
+
+    /// The bounding box of the currently displayed text, if any.
+    pub fn bbox(&self) -> Option<Rect> {
+        self.last_bbox
+    }
 }
 
 pub struct Bar {

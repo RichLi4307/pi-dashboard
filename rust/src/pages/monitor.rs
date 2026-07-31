@@ -10,7 +10,7 @@ use anyhow::Result;
 use time::OffsetDateTime;
 
 use crate::config::{
-    self, ACCENT, ALARM, BG, CAUTION, CONTAINER_PAGE_SIZE, COOL, CYAN,
+    self, hostname, ACCENT, ALARM, BG, CAUTION, CONTAINER_PAGE_SIZE, COOL, CYAN,
     DOCKER_HEADER_Y, DOCKER_LINE_HEIGHT, DOCKER_LIST_Y, GRAY, OK, PANEL,
     ROW_STRIPE, SCROLL_TRACK, SLOW_RENDER_INTERVAL, TREND_HOT, USAGE_COLOR_LUT,
     W, WHITE,
@@ -40,26 +40,27 @@ const HERO_CARD_H: i32 = 40;
 const HERO_CARD_Y: i32 = 40;
 
 const CPU_ROWS: [i32; 2] = [100, 126];
-const CPU_COLS: [i32; 2] = [12, 244];
-const CPU_CELL_RIGHT: [i32; 2] = [236, 468];
-const CPU_BAR_X_OFF: i32 = 38;
+const CPU_COLS: [i32; 2] = [12, 256];
+const CPU_CELL_RIGHT: [i32; 2] = [224, 468];
+const CPU_BAR_X_OFF: i32 = 34;
 const CPU_BAR_Y_OFF: i32 = 1;
-const CPU_BAR_W: i32 = 151;
+const CPU_BAR_W: i32 = 143;
 const CPU_BAR_H: i32 = 10;
 const CPU_BAR_R: i32 = 5;
 
 const DOCKER_RIGHT: i32 = 468;
 const DOCKER_TRACK_X: i32 = 460;
 const DOCKER_TRACK_W: i32 = 4;
-const DOCKER_CONTENT_RIGHT: i32 = 456;
+const DOCKER_CONTENT_RIGHT: i32 = 450;
 const DOCKER_ZEBRA_RIGHT: i32 = 456;
-const NAME_X: i32 = 26;
-const PAGE_RIGHT: i32 = 264;
-const UPTIME_RIGHT: i32 = 336;
-const STATE_RIGHT: i32 = 416;
-const CPU_RIGHT: i32 = 456;
+const DOT_X: i32 = 18;
+const NAME_X: i32 = 30;
+const NAME_TRUNCATE_WIDTH: f32 = 208.0;
+const PAGE_RIGHT: i32 = 242;
+const UPTIME_CENTER: i32 = 274;
+const STATE_CENTER: i32 = 358;
+const CPU_CENTER: i32 = 430;
 const UNDERLINE_Y: i32 = 172;
-const DOT_X: i32 = 16;
 
 const TS_CHIP_RIGHT: i32 = 383;
 const TS_CHIP_W: i32 = 46;
@@ -68,8 +69,8 @@ const TS_CHIP_Y: i32 = 7;
 const TS_CHIP_R: i32 = 9;
 const TIME_RIGHT: i32 = 468;
 
-const TREND_W: i32 = 8;
-const TREND_H: i32 = 6;
+const TREND_W: i32 = 10;
+const TREND_H: i32 = 9;
 
 // ---------------------------------------------------------------------------
 // Temperature trend state.
@@ -183,8 +184,8 @@ impl HeroCard {
         let label_style = TextStyle::new(11, GRAY, false);
         let value_style = TextStyle::new(16, WHITE, false);
         Self {
-            label: Label::new(x + 10, y + 8, label_style, Align::Left, PANEL, fonts),
-            value: Label::new(x + 10, y + 23, value_style, Align::Left, PANEL, fonts),
+            label: Label::new(x + 10, y + 3, label_style, Align::Left, PANEL, fonts),
+            value: Label::new(x + 10, y + 19, value_style, Align::Left, PANEL, fonts),
         }
     }
 
@@ -236,11 +237,11 @@ impl RoundedBar {
         if pct_i == self.last_pct && !color_changed {
             return;
         }
-        // Full redraw: track + fill.
+        // Full redraw: track + inset fill.
         fill_rounded_rect(fb, self.x, self.y, self.w, self.h, self.r, self.track_color);
         let fw = self.fill_width(pct_i);
-        if fw > 0 {
-            fill_rounded_rect(fb, self.x, self.y, fw, self.h, self.r, fill_color);
+        if fw > 2 {
+            fill_rounded_rect(fb, self.x + 1, self.y + 1, fw - 2, self.h - 2, self.r - 1, fill_color);
         }
         self.last_pct = pct_i;
         self.last_fill_color = Some(fill_color);
@@ -317,6 +318,7 @@ pub struct MonitorPage {
 
     // Bottom bar
     footer_label: Label,
+    ip_label: Label,
     fps_label: Label,
 
     // Temperature trend
@@ -369,9 +371,9 @@ impl MonitorPage {
 
         let header_style = TextStyle::new(11, GRAY, false).with_weight(FontWeight::Regular);
         let header_name = Label::new(NAME_X, DOCKER_HEADER_Y, header_style, Align::Left, BG, &fonts);
-        let header_uptime = Label::new(UPTIME_RIGHT, DOCKER_HEADER_Y, header_style, Align::Right, BG, &fonts);
-        let header_state = Label::new(STATE_RIGHT, DOCKER_HEADER_Y, header_style, Align::Right, BG, &fonts);
-        let header_cpu = Label::new(CPU_RIGHT, DOCKER_HEADER_Y, header_style, Align::Right, BG, &fonts);
+        let header_uptime = Label::new(UPTIME_CENTER, DOCKER_HEADER_Y, header_style, Align::Center, BG, &fonts);
+        let header_state = Label::new(STATE_CENTER, DOCKER_HEADER_Y, header_style, Align::Center, BG, &fonts);
+        let header_cpu = Label::new(CPU_CENTER, DOCKER_HEADER_Y, header_style, Align::Center, BG, &fonts);
 
         let mut container_rows = Vec::with_capacity(CONTAINER_PAGE_SIZE);
         for i in 0..CONTAINER_PAGE_SIZE {
@@ -384,16 +386,18 @@ impl MonitorPage {
                 bg,
                 dot_color: None,
                 name: Label::new(NAME_X, y, row_style, Align::Left, bg, &fonts),
-                uptime: Label::new(UPTIME_RIGHT, y, gray_style, Align::Right, bg, &fonts),
-                state: Label::new(STATE_RIGHT, y, row_style, Align::Right, bg, &fonts),
-                cpu: Label::new(CPU_RIGHT, y, row_style, Align::Right, bg, &fonts),
+                uptime: Label::new(UPTIME_CENTER, y, gray_style, Align::Center, bg, &fonts),
+                state: Label::new(STATE_CENTER, y, row_style, Align::Center, bg, &fonts),
+                cpu: Label::new(CPU_CENTER, y, row_style, Align::Center, bg, &fonts),
             });
         }
 
         let page_label = Label::new(PAGE_RIGHT, DOCKER_HEADER_Y, header_style, Align::Right, BG, &fonts);
         let footer_style = TextStyle::new(11, GRAY, false).with_weight(FontWeight::Regular);
-        let footer_label = Label::new(12, config::H as i32 - 18, footer_style, Align::Left, PANEL, &fonts);
-        let fps_label = Label::new(TIME_RIGHT, config::H as i32 - 18, footer_style, Align::Right, PANEL, &fonts);
+        let ip_style = TextStyle::new(11, CYAN, false).with_weight(FontWeight::Regular);
+        let footer_label = Label::new(12, config::H as i32 - 17, footer_style, Align::Left, PANEL, &fonts);
+        let ip_label = Label::new(170, config::H as i32 - 17, ip_style, Align::Left, PANEL, &fonts);
+        let fps_label = Label::new(TIME_RIGHT, config::H as i32 - 17, footer_style, Align::Right, PANEL, &fonts);
 
         Self {
             fonts,
@@ -417,6 +421,7 @@ impl MonitorPage {
             scroll_last_offset: usize::MAX,
             scroll_last_total: usize::MAX,
             footer_label,
+            ip_label,
             fps_label,
             temp_trend_history: VecDeque::new(),
             temp_trend_last_state: TrendState::None,
@@ -470,6 +475,7 @@ impl MonitorPage {
         // Bottom bar.
         fill_rect(fb, 0, config::H as i32 - 20, W as i32, 20, PANEL);
         self.footer_label.force_draw(fb, &self.fonts, "Powered by RichLi4307");
+        self.ip_label.force_draw(fb, &self.fonts, "");
         self.fps_label.force_draw(fb, &self.fonts, "15 FPS");
     }
 
@@ -477,7 +483,7 @@ impl MonitorPage {
     // Slow content (1 Hz).
     // -----------------------------------------------------------------------
     fn draw_slow_content(&mut self, fb: &mut Framebuffer, snapshot: &MetricsSnapshot) {
-        self.host_label.set(fb, &self.fonts, "FocusRasPi4B");
+        self.host_label.set(fb, &self.fonts, hostname());
 
         let now_str = {
             let dt = OffsetDateTime::now_local().unwrap_or_else(|_| OffsetDateTime::now_utc());
@@ -487,6 +493,17 @@ impl MonitorPage {
 
         let ts_on = snapshot.tailscale == "ON";
         self.ts_chip.draw(fb, &self.fonts, ts_on);
+
+        // Bottom bar IP (center).
+        let ip_text = snapshot
+            .ips
+            .iter()
+            .filter(|ip| *ip != "No IP")
+            .take(2)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(" · ");
+        self.ip_label.set(fb, &self.fonts, &ip_text);
 
         // Hero values.
         let temp_val = parse_temp(&snapshot.temp).unwrap_or(50);
@@ -506,19 +523,7 @@ impl MonitorPage {
         let now = self.now_secs();
         self.update_temp_trend(now, temp_val as f32);
         let (trend_state, trend_alarm) = self.evaluate_temp_trend(now);
-        let value_style = TextStyle::new(16, temp_color, false);
-        let value_w = self.fonts.measure(&snapshot.temp, &value_style) as i32;
-        let trend_x = HERO_CARD_X[0] + 10 + value_w + 4;
-        let trend_y = self.temp_card.value.baseline_y();
-        let fonts = self.fonts.clone();
-        self.draw_temp_trend(
-            fb,
-            &fonts,
-            trend_x,
-            trend_y,
-            trend_state,
-            trend_alarm,
-        );
+        self.draw_temp_value(fb, &snapshot.temp, trend_state, trend_alarm);
     }
 
     // -----------------------------------------------------------------------
@@ -564,7 +569,7 @@ impl MonitorPage {
                 let state_color = Self::container_state_color(&c.state, status_unhealthy);
                 let name_style = TextStyle::new(11, WHITE, false).with_weight(FontWeight::Regular);
 
-                let display_name = Self::truncate_to_width(&c.name, (PAGE_RIGHT - NAME_X - 4) as f32, &self.fonts, &name_style);
+                let display_name = Self::truncate_to_width(&c.name, NAME_TRUNCATE_WIDTH, &self.fonts, &name_style);
                 row.name.set(fb, &self.fonts, &display_name);
 
                 let abbr = abbreviate_status(&c.status);
@@ -734,15 +739,18 @@ impl MonitorPage {
         (state, alarm)
     }
 
-    fn draw_temp_trend(
+    fn draw_temp_value(
         &mut self,
         fb: &mut Framebuffer,
-        fonts: &Fonts,
-        x: i32,
-        baseline_y: i32,
+        temp_text: &str,
         state: TrendState,
         alarm: bool,
     ) {
+        let value_label = &mut self.temp_card.value;
+        let temp_val = parse_temp(temp_text).unwrap_or(50);
+        value_label.set_style_color(temp_band_color(temp_val));
+        value_label.set(fb, &self.fonts, temp_text);
+
         if state == TrendState::None {
             if let Some(last) = self.temp_trend_last_bbox {
                 fill_rect(fb, last.x1 as i32, last.y1 as i32, last.width() as i32, last.height() as i32, PANEL);
@@ -753,23 +761,21 @@ impl MonitorPage {
             return;
         }
 
-        let arrow_color = match state {
-            TrendState::Rising => TREND_HOT,
-            TrendState::Falling => COOL,
-            TrendState::Steady => GRAY,
-            TrendState::None => PANEL,
-        };
+        let value_bbox = value_label.bbox().unwrap_or(Rect::new(0, 0, 0, 0));
+        let trend_x = value_bbox.x2 as i32 + 4 + TREND_W / 2;
+        let trend_cy = value_bbox.y1 as i32 + 9;
+        let baseline_y = value_label.baseline_y();
 
-        let mut new_bbox = Rect::new(
-            x.max(0) as usize,
-            (baseline_y - TREND_H / 2).max(0) as usize,
-            (x + TREND_W).max(0) as usize,
-            (baseline_y + TREND_H / 2 + 1).max(0) as usize,
+        let arrow_bbox = Rect::new(
+            (trend_x - TREND_W / 2).max(0) as usize,
+            (trend_cy - TREND_H / 2).max(0) as usize,
+            (trend_x + TREND_W / 2 + 1).max(0) as usize,
+            (trend_cy + TREND_H / 2 + 1).max(0) as usize,
         );
         let alarm_bbox = if alarm {
             let style = TextStyle::new(16, ALARM, false);
-            let g = fonts.glyph_ref('!', &style);
-            let ax = x + TREND_W + 4;
+            let g = self.fonts.glyph_ref('!', &style);
+            let ax = trend_x + TREND_W / 2 + 1 + 4;
             let gx = ax + g.xmin;
             let gy = baseline_y - g.ymin - g.height as i32 + 1;
             Some(Rect::new(
@@ -781,6 +787,9 @@ impl MonitorPage {
         } else {
             None
         };
+
+        let mut new_bbox = arrow_bbox;
+        new_bbox = new_bbox.union(&value_bbox);
         if let Some(ab) = alarm_bbox {
             new_bbox = new_bbox.union(&ab);
         }
@@ -796,14 +805,26 @@ impl MonitorPage {
             fill_rect(fb, last.x1 as i32, last.y1 as i32, last.width() as i32, last.height() as i32, PANEL);
         }
 
+        // Force redraw the value so value + arrow + alarm are rendered atomically
+        // in the same frame within the same dirty region.
+        value_label.force_draw(fb, &self.fonts, temp_text);
+
+        let arrow_color = match state {
+            TrendState::Rising => TREND_HOT,
+            TrendState::Falling => COOL,
+            TrendState::Steady => GRAY,
+            TrendState::None => PANEL,
+        };
+
         match state {
-            TrendState::Rising => fill_triangle(fb, x + TREND_W / 2, baseline_y, TREND_W, TREND_H, true, arrow_color),
-            TrendState::Falling => fill_triangle(fb, x + TREND_W / 2, baseline_y, TREND_W, TREND_H, false, arrow_color),
-            TrendState::Steady => fill_rect(fb, x, baseline_y - 1, TREND_W, 2, arrow_color),
+            TrendState::Rising => fill_triangle(fb, trend_x, trend_cy, TREND_W, TREND_H, true, arrow_color),
+            TrendState::Falling => fill_triangle(fb, trend_x, trend_cy, TREND_W, TREND_H, false, arrow_color),
+            TrendState::Steady => fill_rect(fb, trend_x - TREND_W / 2, trend_cy - 1, TREND_W, 3, arrow_color),
             TrendState::None => {}
         }
         if alarm {
-            fonts.draw(fb, "!", x + TREND_W + 4, baseline_y, &TextStyle::new(16, ALARM, false));
+            let ax = trend_x + TREND_W / 2 + 1 + 4;
+            self.fonts.draw(fb, "!", ax, baseline_y, &TextStyle::new(16, ALARM, false));
         }
 
         self.temp_trend_last_state = state;
@@ -857,6 +878,7 @@ impl Page for MonitorPage {
         self.temp_trend_last_bbox = None;
         self.scroll_last_offset = usize::MAX;
         self.scroll_last_total = usize::MAX;
+        self.ip_label.clear(fb);
         fb.mark_full_dirty();
     }
 
@@ -950,5 +972,62 @@ mod tests {
         assert!(!png.is_empty());
         let path = "/tmp/pi_dashboard_golden_rust.png";
         std::fs::write(path, png).expect("write png");
+    }
+
+    #[test]
+    fn cpu_bar_fill_inset_preserves_outline() {
+        use crate::render::rgb888_to_rgb565;
+
+        let mut fb = Framebuffer::headless();
+        let mut bar = RoundedBar::new(10, 10, 20, 10, 5, 0x00ff00);
+        // fw = 19 (95% of 20); exercise the inset fill path.
+        bar.set(&mut fb, 95.0, 0xff0000);
+        let buf = fb.buffer();
+        let fill = rgb888_to_rgb565(0xff0000);
+        let track = rgb888_to_rgb565(0x00ff00);
+
+        // a) Fill pixels must stay within x+1 .. x+w-1.
+        for row in 10..20 {
+            let start = row * crate::config::W;
+            for col in 0..crate::config::W {
+                if buf[start + col] == fill {
+                    assert!(
+                        col >= 11 && col <= 28,
+                        "fill pixel overflows track outline at ({}, {})",
+                        col,
+                        row
+                    );
+                }
+            }
+        }
+
+        // b) Track left edge corner outline (inset 5/2/1 rows) is not covered.
+        // For r=5 at row 10/11/12 the leftmost track pixels are at x=15/12/11.
+        for (row, col) in [(10, 15), (11, 12), (12, 11)] {
+            let idx = row * crate::config::W + col;
+            assert_eq!(
+                buf[idx], track,
+                "track left edge overwritten at row {} col {}",
+                row, col
+            );
+        }
+
+        // c) Left/right fill insets are symmetric per row (relative to the fill's own bounds).
+        let fill_left = 11;
+        let fill_right = 11 + 17 - 1; // x + w - 1 for the inset fill rect
+        for row in 10..20 {
+            let start = row * crate::config::W;
+            let left = (0..crate::config::W).position(|c| buf[start + c] == fill);
+            let right = (0..crate::config::W).rposition(|c| buf[start + c] == fill);
+            if let (Some(l), Some(r)) = (left, right) {
+                let left_inset = l - fill_left;
+                let right_inset = fill_right - r;
+                assert_eq!(
+                    left_inset, right_inset,
+                    "asymmetric fill at row {}: left_inset={}, right_inset={}",
+                    row, left_inset, right_inset
+                );
+            }
+        }
     }
 }

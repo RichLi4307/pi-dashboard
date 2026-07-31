@@ -211,7 +211,7 @@ pub fn fill_triangle(fb: &mut Framebuffer, cx: i32, cy: i32, w: i32, h: i32, up:
             y_bottom - 1 - row as i32
         } as f32;
         let ratio = (dy / half_h).clamp(0.0, 1.0);
-        let half = half_w * (1.0 - ratio);
+        let half = half_w * ratio;
         let xl = ((cx as f32 - half).ceil() as i32).max(0) as usize;
         let xr = ((cx as f32 + half).floor() as i32 + 1).min(W as i32).max(xl as i32) as usize;
         if xl >= xr {
@@ -273,5 +273,39 @@ mod tests {
         let mut fb = setup();
         fill_triangle(&mut fb, 50, 50, 0, 6, true, 0xffffff);
         assert!(fb.dirty_rects().is_empty());
+    }
+
+    #[test]
+    fn triangle_direction_up_narrows_at_top() {
+        let mut fb = setup();
+        // Up triangle: apex at top, base at bottom.
+        fill_triangle(&mut fb, 50, 50, 10, 9, true, 0xffffff);
+        let buf = fb.buffer();
+        let white = rgb888_to_rgb565(0xffffff);
+        let count_row = |y: usize| {
+            let start = y * W;
+            buf[start..start + W].iter().filter(|&&p| p == white).count()
+        };
+        let top = count_row(46);
+        let bottom = count_row(54);
+        assert!(top > 0, "up triangle top row must have pixels");
+        assert!(top < bottom, "up triangle must be narrower at top ({} vs {})", top, bottom);
+    }
+
+    #[test]
+    fn triangle_direction_down_narrows_at_bottom() {
+        let mut fb = setup();
+        // Down triangle: apex at bottom, base at top.
+        fill_triangle(&mut fb, 50, 50, 10, 9, false, 0xffffff);
+        let buf = fb.buffer();
+        let white = rgb888_to_rgb565(0xffffff);
+        let count_row = |y: usize| {
+            let start = y * W;
+            buf[start..start + W].iter().filter(|&&p| p == white).count()
+        };
+        let top = count_row(46);
+        let bottom = count_row(54);
+        assert!(bottom > 0, "down triangle bottom row must have pixels");
+        assert!(bottom < top, "down triangle must be narrower at bottom ({} vs {})", bottom, top);
     }
 }
