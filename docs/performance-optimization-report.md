@@ -129,12 +129,36 @@ sudo systemctl restart pi-dashboard.service
 
 ---
 
+## 6. 追加：Docker Engine REST API 替代 `docker ps` CLI（2026-07-31）
+
+### 6.1 改动
+
+`rust/src/metrics.rs`：
+
+- 新增 `DOCKER_SOCK` + `docker_api_get` + `read_docker_containers_api`。
+- `read_docker_containers_with_cpu` 优先调用 API；失败时 `warn` 并 fallback 到 `docker ps` CLI。
+- 零新增 crate，仍用 `tokio::net::UnixStream` + `serde::Deserialize`。
+
+### 6.2 验证
+
+- `cargo test --release`：**29/29 通过**。
+- `journalctl -u pi-dashboard.service` 无 API fallback 警告，API 路径生效。
+- 系统级 `pidstat 1 60` 显示 `docker` CLI 命令不再周期性出现。
+
+### 6.3 运行约束（新增）
+
+- 面板用户必须在 `docker` 组。
+- `/var/run/docker.sock` 必须可读写（当前 `root:docker 660`）。
+- Docker Engine API 字段 `Id` / `Names` / `State` / `Status` 保持兼容。
+- 如约束被破坏，自动回退 CLI，不影响功能。
+
 ## 7. 后续可选方向
 
 按用户决策，保留 Docker 轮询本身，不再拆分列表刷新频率，避免损失面板功能。若未来仍需进一步压低 dockerd/containerd 波动，可考虑：
 
-1. **把 `docker ps` 也改为 Docker Engine API（`/var/run/docker.sock`）**：避免 fork/exec docker CLI 开销，但实现复杂度较高。
+1. ~~**把 `docker ps` 也改为 Docker Engine API（`/var/run/docker.sock`）**：已实施。~~
 2. **分离容器列表与 CPU 采样周期**：列表 10s，CPU 2s，但会牺牲列表新鲜度。
 3. **cgroup 路径枚举发现容器**：彻底绕过 dockerd，但无法直接获得容器名称/状态，需要额外映射。
+4. **Docker events 事件流 + 兜底刷新**：长期最优，但长连接稳定性需充分测试。
 
 当前方案在功能完整性与性能之间取得较好平衡。

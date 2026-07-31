@@ -9,6 +9,9 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::LazyLock;
 use std::time::Duration;
 
+use serde::Deserialize;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::UnixStream;
 use tokio::process::Command;
 use tokio::sync::watch;
 use tokio::time::{interval, timeout};
@@ -68,6 +71,73 @@ impl ContainerCpuSampler {
         }
         None
     }
+}
+
+// ---------------------------------------------------------------------------
+// Docker Engine API (unix socket) helpers.
+// Replaces the heavier `docker ps` CLI fork with a direct HTTP/1.1 call.
+// ---------------------------------------------------------------------------
+
+const DOCKER_SOCK: &str = "/var/run/docker.sock";
+
+#[derive(Debug, Deserialize)]
+struct DockerContainer {
+    Id: String,
+    Names: Vec<String>,
+    State: String,
+    Status: String,
+}
+
+async fn docker_api_get(path: &str) -> Option<String> {
+    let mut stream = UnixStream::connect(DOCKER_SOCK).await.ok()?;
+    let req = format!(
+        "GET {} HTTP/1.1\r\nHost: docker\r\nConnection: close\r\n\r\n",
+        path
+    );
+    stream.write_all(req.as_bytes()).await.ok()?;
+
+    let mut buf = Vec::with_capacity(8192);
+    let mut tmp = [0u8; 4096];
+    loop {
+        let n = stream.read(&mut tmp).await.ok()?;
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&tmp[..n]);
+    }
+
+    // Split headers and body at the first empty line.
+    let body_start = find_subsequence(&buf, b"\r\n\r\n")? + 4;
+    let body = String::from_utf8_lossy(&buf[body_start..]).to_string();
+    Some(body)
+}
+
+fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|w| w == needle)
+}
+
+async fn read_docker_containers_api() -> Option<Vec<ContainerInfo>> {
+    let body = docker_api_get("/containers/json?all=1").await?;
+    let list: Vec<DockerContainer> = serde_json::from_str(&body).ok()?;
+    Some(
+        list.into_iter()
+            .map(|c| ContainerInfo {
+                name: c
+                    .Names
+                    .into_iter()
+                    .next()
+                    .unwrap_or_default()
+                    .trim_start_matches('/')
+                    .to_string(),
+                id: c.Id,
+                status: c.Status,
+                state: c.State,
+                cpu: None,
+            })
+            .collect(),
+    )
 }
 
 /// Abbreviate a docker `Status` string for the dashboard container list.
@@ -404,7 +474,13 @@ static CONTAINER_CPU_SAMPLER: LazyLock<std::sync::Mutex<ContainerCpuSampler>> =
 /// Join freshly fetched container list with CPU data read from cgroup v2.
 /// Falls back to the previous sample's CPU if cgroup is not yet readable.
 pub async fn read_docker_containers_with_cpu(prev: &[ContainerInfo]) -> Vec<ContainerInfo> {
-    let mut containers = read_docker_containers().await;
+    let mut containers = match read_docker_containers_api().await {
+        Some(list) => list,
+        None => {
+            warn!("Docker Engine API unavailable, falling back to docker ps CLI");
+            read_docker_containers().await
+        }
+    };
     let now = std::time::Instant::now();
     let mut sampler = match CONTAINER_CPU_SAMPLER.lock() {
         Ok(g) => g,
