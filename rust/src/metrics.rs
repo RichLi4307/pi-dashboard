@@ -19,6 +19,93 @@ use crate::config::{
 
 pub type ContainerInfo = (String, String, String);
 
+/// Abbreviate a docker `Status` string for the dashboard container list.
+/// Parenthetical health suffixes `(healthy)` / `(unhealthy)` are stripped from
+/// the returned text; callers should detect `(unhealthy)` separately for the
+/// STATE column colour.
+pub fn abbreviate_status(status: &str) -> String {
+    let s = status
+        .replace(" (healthy)", "")
+        .replace("(healthy)", "")
+        .replace(" (unhealthy)", "")
+        .replace("(unhealthy)", "");
+    let s = s.trim();
+
+    if s == "Created" {
+        return "New".to_string();
+    }
+    if s == "Paused" {
+        return "Paus".to_string();
+    }
+
+    if s == "Up About an hour" || s == "Up about an hour" {
+        return "1h".to_string();
+    }
+    if s == "Up Less than a second" || s == "Up less than a second" {
+        return "0s".to_string();
+    }
+
+    if let Some(rest) = s.strip_prefix("Up ") {
+        if let Some((num, unit)) = parse_duration(rest) {
+            return format!("{}{}", num, unit);
+        }
+    }
+
+    if let Some(rest) = s.strip_prefix("Exited ") {
+        // Expected: "(0) 3 hours ago"
+        if let Some(after_paren) = rest.split_once(')').map(|(_, r)| r.trim()) {
+            let code = rest
+                .trim_start_matches('(')
+                .split_once(')')
+                .map(|(c, _)| c)
+                .unwrap_or("?");
+            if let Some((num, unit)) = parse_duration(after_paren) {
+                return format!("Ex{} {}{}", code, num, unit);
+            }
+        }
+    }
+
+    if s.starts_with("Restarting ") {
+        // Expected: "Restarting (1) 5 seconds ago"
+        if let Some((_, after_paren)) = s.split_once(')') {
+            if let Some((num, unit)) = parse_duration(after_paren.trim()) {
+                return format!("Rst {}{}", num, unit);
+            }
+        }
+    }
+
+    s.to_string()
+}
+
+/// Parse a docker duration fragment such as "45 seconds" or "3 hours ago".
+/// Returns the numeric value and a one/two-letter unit suffix.
+fn parse_duration(text: &str) -> Option<(u32, &'static str)> {
+    let words: Vec<&str> = text.split_whitespace().collect();
+    if words.len() < 2 {
+        return None;
+    }
+    let num = words[0].parse::<u32>().ok()?;
+    let unit = words[1].to_ascii_lowercase();
+    let suffix = if unit.starts_with("second") {
+        "s"
+    } else if unit.starts_with("minute") {
+        "m"
+    } else if unit.starts_with("hour") {
+        "h"
+    } else if unit.starts_with("day") {
+        "d"
+    } else if unit.starts_with("week") {
+        "w"
+    } else if unit.starts_with("month") {
+        "mo"
+    } else if unit.starts_with("year") {
+        "y"
+    } else {
+        return None;
+    };
+    Some((num, suffix))
+}
+
 #[derive(Clone, Default, Debug)]
 pub struct MetricsSnapshot {
     pub ips: Vec<String>,
@@ -381,5 +468,39 @@ mod tests {
             assert!(name.starts_with("cpu"));
             assert!(*pct >= 0.0 && *pct <= 100.0);
         }
+    }
+
+    #[test]
+    fn abbreviate_status_up_units() {
+        assert_eq!(abbreviate_status("Up 45 seconds"), "45s");
+        assert_eq!(abbreviate_status("Up 1 second"), "1s");
+        assert_eq!(abbreviate_status("Up 5 minutes"), "5m");
+        assert_eq!(abbreviate_status("Up 2 hours"), "2h");
+        assert_eq!(abbreviate_status("Up 3 days"), "3d");
+        assert_eq!(abbreviate_status("Up 1 weeks"), "1w");
+        assert_eq!(abbreviate_status("Up 2 months"), "2mo");
+        assert_eq!(abbreviate_status("Up 1 years"), "1y");
+    }
+
+    #[test]
+    fn abbreviate_status_special_and_health() {
+        assert_eq!(abbreviate_status("Up About an hour"), "1h");
+        assert_eq!(abbreviate_status("Up Less than a second"), "0s");
+        assert_eq!(abbreviate_status("Up 2 hours (healthy)"), "2h");
+        assert_eq!(abbreviate_status("Up 2 hours (unhealthy)"), "2h");
+    }
+
+    #[test]
+    fn abbreviate_status_exited_and_restarting() {
+        assert_eq!(abbreviate_status("Exited (0) 3 hours ago"), "Ex0 3h");
+        assert_eq!(abbreviate_status("Exited (137) 5 minutes ago"), "Ex137 5m");
+        assert_eq!(abbreviate_status("Restarting (1) 5 seconds ago"), "Rst 5s");
+    }
+
+    #[test]
+    fn abbreviate_status_states_and_fallback() {
+        assert_eq!(abbreviate_status("Created"), "New");
+        assert_eq!(abbreviate_status("Paused"), "Paus");
+        assert_eq!(abbreviate_status("Unknown weird state"), "Unknown weird state");
     }
 }

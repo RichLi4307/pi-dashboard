@@ -131,14 +131,18 @@ sudo systemctl start pi-dashboard.service
 
 ### 回退到 Python 版
 
+> 注意：Python 包已于 2026-07-31 归档到 `backups/python-legacy/`，
+> 仅恢复 service 文件不够，必须先恢复 Python 包。
+
 ```bash
-# 恢复 Python 版 service（使用最近一次备份）
+# 1. 恢复 Python 包
+cp -r /home/richli/pi_dashboard/backups/python-legacy/. /home/richli/pi_dashboard/
+
+# 2. 恢复 Python 版 service（使用最近一次备份）
 sudo cp /home/richli/pi_dashboard/backups/pi-dashboard.service.20260729-124524.bak /etc/systemd/system/pi-dashboard.service
 sudo systemctl daemon-reload
 sudo systemctl restart pi-dashboard.service
 ```
-
-> Python 包 `/home/richli/pi_dashboard/` 完整保留，未删除。
 
 ---
 

@@ -25,6 +25,16 @@ pub const ORANGE: u32 = 0xf0883e;
 pub const BLUE: u32 = 0x58a6ff;
 pub const OVERLAY_BG: u32 = 0x333333;
 
+// ---------------------------------------------------------------------------
+// Semantic colour aliases used by the monitor page.
+// ---------------------------------------------------------------------------
+pub const OK: u32 = GREEN;              // 0x3fb950
+pub const CAUTION: u32 = YELLOW;        // 0xd29922
+pub const ALARM: u32 = 0xff0000;        // user-specified alarm red
+pub const COOL: u32 = BLUE;             // 0x58a6ff
+pub const ROW_STRIPE: u32 = 0x131a24;   // zebra stripe between BG and PANEL
+pub const SCROLL_TRACK: u32 = 0x21262e; // container scroll track
+
 pub const USAGE_GRADIENT: &[(f32, u32)] = &[
     (0.0, 0x3fb950),
     (0.45, 0x7ee787),
@@ -153,10 +163,11 @@ pub fn gradient_color(ratio: f32, stops: &[(f32, u32)]) -> u32 {
 
 /// Parse a percentage string such as "45%" or "1234/4096MB (50%)".
 pub fn parse_percent(text: &str) -> Option<i32> {
-    // Take the last occurrence of a number followed by '%'.
+    // Take the last occurrence of a number followed by '%', allowing
+    // surrounding punctuation like parentheses or units.
     let mut last = None;
-    for m in text.split_whitespace() {
-        if let Some(stripped) = m.strip_suffix('%') {
+    for token in text.split(|c: char| !c.is_ascii_digit() && c != '.' && c != '%') {
+        if let Some(stripped) = token.strip_suffix('%') {
             if let Ok(v) = stripped.parse::<f32>() {
                 last = Some(v as i32);
             }
@@ -171,4 +182,70 @@ pub fn parse_temp(text: &str) -> Option<i32> {
         .next()
         .and_then(|s| s.parse::<f32>().ok())
         .map(|v| v as i32)
+}
+
+/// Hard temperature band colour used for the temperature value and trend arrow.
+pub fn temp_band_color(t: i32) -> u32 {
+    if t < 50 {
+        COOL
+    } else if t < 65 {
+        WHITE
+    } else if t < 75 {
+        CAUTION
+    } else if t < 80 {
+        ORANGE
+    } else {
+        ALARM
+    }
+}
+
+/// Usage percentage colour for numeric text labels (CPU/MEM/DISK).
+pub fn usage_text_color(pct: i32) -> u32 {
+    if pct < 80 {
+        WHITE
+    } else if pct < 90 {
+        CAUTION
+    } else {
+        ALARM
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_percent_last() {
+        assert_eq!(parse_percent("45%"), Some(45));
+        assert_eq!(parse_percent("1234/4096MB (50%)"), Some(50));
+    }
+
+    #[test]
+    fn parse_temp_int() {
+        assert_eq!(parse_temp("42C"), Some(42));
+        assert_eq!(parse_temp("42.5C"), Some(42));
+    }
+
+    #[test]
+    fn temp_band_color_boundaries() {
+        assert_eq!(temp_band_color(49), COOL);
+        assert_eq!(temp_band_color(50), WHITE);
+        assert_eq!(temp_band_color(64), WHITE);
+        assert_eq!(temp_band_color(65), CAUTION);
+        assert_eq!(temp_band_color(74), CAUTION);
+        assert_eq!(temp_band_color(75), ORANGE);
+        assert_eq!(temp_band_color(79), ORANGE);
+        assert_eq!(temp_band_color(80), ALARM);
+        assert_eq!(temp_band_color(85), ALARM);
+    }
+
+    #[test]
+    fn usage_text_color_boundaries() {
+        assert_eq!(usage_text_color(0), WHITE);
+        assert_eq!(usage_text_color(79), WHITE);
+        assert_eq!(usage_text_color(80), CAUTION);
+        assert_eq!(usage_text_color(89), CAUTION);
+        assert_eq!(usage_text_color(90), ALARM);
+        assert_eq!(usage_text_color(100), ALARM);
+    }
 }

@@ -3,30 +3,47 @@
 //! All mutable text fields are `Label` instances; only changed values redraw.
 //! CPU bars are `Bar` instances. Dirty regions are honest: no blanket marks.
 
+use std::collections::VecDeque;
 use std::time::Instant;
 
 use anyhow::Result;
 use time::OffsetDateTime;
 
 use crate::config::{
-    self, ACCENT, BG, CONTAINER_PAGE_SIZE, CYAN, DOCKER_HEADER_Y, DOCKER_LINE_HEIGHT,
-    DOCKER_LIST_Y, DOCKER_START_Y, GRAY, GREEN, PANEL, RED, SLOW_RENDER_INTERVAL,
-    TEMP_COLOR_LUT, USAGE_COLOR_LUT, W, WHITE, YELLOW,
+    self, ACCENT, ALARM, BG, CAUTION, CONTAINER_PAGE_SIZE, CYAN, DOCKER_HEADER_Y,
+    DOCKER_LINE_HEIGHT, DOCKER_LIST_Y, DOCKER_START_Y, GRAY, GREEN, OK, PANEL, RED,
+    ROW_STRIPE, SCROLL_TRACK, SLOW_RENDER_INTERVAL, USAGE_COLOR_LUT, W, WHITE,
 };
-use crate::config::{parse_percent, parse_temp};
-use crate::fb::Framebuffer;
+use crate::config::{parse_percent, parse_temp, temp_band_color, usage_text_color};
+use crate::fb::{Framebuffer, Rect};
 use crate::label::{Align, Bar, Label};
-use crate::metrics::{ContainerInfo, MetricsSnapshot};
+use crate::metrics::{abbreviate_status, ContainerInfo, MetricsSnapshot};
 use crate::pages::{Page, PageAction};
-use crate::render::{draw_line_h, fill_rect};
+use crate::render::{draw_line_h, fill_ellipse, fill_rect};
 use crate::text::{FontWeight, Fonts, TextStyle};
 use crate::touch::TouchEvent;
 
-/// A row of container labels: name, status, state.
+const TEMP_TREND_WINDOW_SECS: f32 = 60.0;
+const TEMP_TREND_COMPARE_SECS: f32 = 30.0;
+const TEMP_TREND_DEADBAND: f32 = 1.0;
+
+/// A row of container labels: name, status, state, plus a state dot.
 struct ContainerRow {
     name: Label,
     status: Label,
     state: Label,
+    bg: u32,
+    dot_x: i32,
+    dot_y: i32,
+    dot_color: Option<u32>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TrendState {
+    None,
+    Rising,
+    Falling,
+    Steady,
 }
 
 pub struct MonitorPage {
@@ -54,12 +71,20 @@ pub struct MonitorPage {
     mem_label: Label,
     disk_label: Label,
 
+    // Temperature trend
+    temp_trend_history: VecDeque<(f32, f32)>,
+    temp_trend_last_state: TrendState,
+    temp_trend_last_alarm: bool,
+    temp_trend_last_bbox: Option<Rect>,
+
     // Container list
     container_header_name: Label,
     container_header_status: Label,
     container_header_state: Label,
     container_rows: Vec<ContainerRow>,
     page_label: Label,
+    scroll_last_offset: usize,
+    scroll_last_total: usize,
 
     // Bottom bar
     footer_label: Label,
@@ -111,14 +136,19 @@ impl MonitorPage {
         let mut container_rows = Vec::with_capacity(CONTAINER_PAGE_SIZE);
         for i in 0..CONTAINER_PAGE_SIZE {
             let y = DOCKER_LIST_Y + i as i32 * DOCKER_LINE_HEIGHT;
+            let bg = if i % 2 == 1 { ROW_STRIPE } else { BG };
             container_rows.push(ContainerRow {
-                name: Label::new(20, y, tiny_style, Align::Left, BG, &fonts),
-                status: Label::new(175, y, TextStyle::new(11, GRAY, false).with_weight(FontWeight::Regular), Align::Left, BG, &fonts),
-                state: Label::new(360, y, tiny_style, Align::Left, BG, &fonts),
+                name: Label::new(20, y, tiny_style, Align::Left, bg, &fonts),
+                status: Label::new(175, y, TextStyle::new(11, GRAY, false).with_weight(FontWeight::Regular), Align::Left, bg, &fonts),
+                state: Label::new(360, y, tiny_style, Align::Left, bg, &fonts),
+                bg,
+                dot_x: 350,
+                dot_y: y + 8,
+                dot_color: None,
             });
         }
 
-        let page_label = Label::new(420, DOCKER_LIST_Y, TextStyle::new(11, YELLOW, false), Align::Left, BG, &fonts);
+        let page_label = Label::new(420, DOCKER_LIST_Y, TextStyle::new(11, GRAY, false), Align::Left, BG, &fonts);
         let footer_label = Label::new(8, config::H as i32 - 18, TextStyle::new(11, GRAY, false).with_weight(FontWeight::Regular), Align::Left, PANEL, &fonts);
         let fps_label = Label::new(340, config::H as i32 - 18, TextStyle::new(11, GRAY, false).with_weight(FontWeight::Regular), Align::Left, PANEL, &fonts);
 
@@ -138,11 +168,17 @@ impl MonitorPage {
             temp_label,
             mem_label,
             disk_label,
+            temp_trend_history: VecDeque::new(),
+            temp_trend_last_state: TrendState::None,
+            temp_trend_last_alarm: false,
+            temp_trend_last_bbox: None,
             container_header_name,
             container_header_status,
             container_header_state,
             container_rows,
             page_label,
+            scroll_last_offset: usize::MAX,
+            scroll_last_total: usize::MAX,
             footer_label,
             fps_label,
             metric_value_x: [0; 3],
@@ -184,6 +220,16 @@ impl MonitorPage {
         // Horizontal separator.
         draw_line_h(fb, 0, W as i32, 100, ACCENT);
 
+        // Container list zebra stripes (static background).
+        for i in 0..CONTAINER_PAGE_SIZE as i32 {
+            let y = DOCKER_LIST_Y + i * DOCKER_LINE_HEIGHT;
+            if i % 2 == 1 {
+                fill_rect(fb, 4, y, 470 - 4, DOCKER_LINE_HEIGHT, ROW_STRIPE);
+            }
+        }
+        // Container header underline.
+        draw_line_h(fb, 4, 470, DOCKER_LIST_Y - 3, ACCENT);
+
         // Container header.
         self.container_header_name.force_draw(fb, &self.fonts, "CONTAINER");
         self.container_header_status.force_draw(fb, &self.fonts, "STATUS");
@@ -216,19 +262,39 @@ impl MonitorPage {
         self.ip_label.set(fb, &self.fonts, &format!("IP {ip_str}"));
 
         // Metric values.
+        let temp_val = parse_temp(&snapshot.temp).unwrap_or(50);
+        let temp_color = temp_band_color(temp_val);
         self.temp_label.set_x(self.metric_value_x[0]);
-        self.temp_label
-            .set_style_color(Self::temp_color(&snapshot.temp));
+        self.temp_label.set_style_color(temp_color);
         self.temp_label.set(fb, &self.fonts, &snapshot.temp);
 
+        // Temperature trend arrow + alarm mark.
+        let now = self.now_secs();
+        self.update_temp_trend(now, temp_val as f32);
+        let (trend_state, trend_alarm) = self.evaluate_temp_trend(now);
+        let temp_style = TextStyle::new(13, temp_color, false);
+        let trend_x = self.metric_value_x[0]
+            + self.fonts.measure(&snapshot.temp, &temp_style) as i32
+            + 4;
+        let fonts = self.fonts.clone();
+        self.draw_temp_trend(
+            fb,
+            &fonts,
+            trend_x,
+            self.temp_label.baseline_y(),
+            temp_color,
+            trend_state,
+            trend_alarm,
+        );
+
         self.mem_label.set_x(self.metric_value_x[1]);
-        self.mem_label
-            .set_style_color(Self::usage_color(&snapshot.mem));
+        let mem_pct = parse_percent(&snapshot.mem).unwrap_or(0);
+        self.mem_label.set_style_color(usage_text_color(mem_pct));
         self.mem_label.set(fb, &self.fonts, &snapshot.mem);
 
         self.disk_label.set_x(self.metric_value_x[2]);
-        self.disk_label
-            .set_style_color(Self::usage_color(&snapshot.disk));
+        let disk_pct = parse_percent(&snapshot.disk).unwrap_or(0);
+        self.disk_label.set_style_color(usage_text_color(disk_pct));
         self.disk_label.set(fb, &self.fonts, &snapshot.disk);
 
         // Container list.
@@ -247,21 +313,32 @@ impl MonitorPage {
 
         for (i, row) in self.container_rows.iter_mut().enumerate() {
             if let Some((name, status, state)) = visible.get(i).map(|c| (&c.0, &c.1, &c.2)) {
-                let color = match state.as_str() {
-                    "running" => GREEN,
-                    "exited" => RED,
-                    _ => YELLOW,
-                };
-                row.name.set(fb, &self.fonts, name);
-                row.status.set(fb, &self.fonts, status);
-                row.state.set_style_color(color);
-                row.state.set(fb, &self.fonts, state);
+                let status_unhealthy = status.contains("(unhealthy)");
+                let state_color = Self::container_state_color(state, status_unhealthy);
+                let tiny_style = TextStyle::new(11, WHITE, false).with_weight(FontWeight::Regular);
+                let status_style = TextStyle::new(11, GRAY, false).with_weight(FontWeight::Regular);
+
+                let display_name = Self::truncate_to_width(name, 151.0, &self.fonts, &tiny_style);
+                row.name.set(fb, &self.fonts, &display_name);
+
+                let abbr_status = abbreviate_status(status);
+                let display_status = Self::truncate_to_width(&abbr_status, 181.0, &self.fonts, &status_style);
+                row.status.set(fb, &self.fonts, &display_status);
+
+                let display_state = Self::truncate_to_width(state, 112.0, &self.fonts, &tiny_style);
+                row.state.set_style_color(state_color);
+                row.state.set(fb, &self.fonts, &display_state);
+
+                Self::draw_state_dot(fb, row, state_color);
             } else {
                 row.name.clear(fb);
                 row.status.clear(fb);
                 row.state.clear(fb);
+                Self::clear_state_dot(fb, row);
             }
         }
+
+        self.draw_scroll_track(fb, offset, total);
 
         let total_pages = ((total + CONTAINER_PAGE_SIZE - 1) / CONTAINER_PAGE_SIZE).max(1);
         let current_page = (offset / CONTAINER_PAGE_SIZE) + 1;
@@ -283,21 +360,237 @@ impl MonitorPage {
             let color = USAGE_COLOR_LUT[pct as usize];
             self.cpu_bars[idx].set(fb, pct, color);
             let pct_text = format!("{:.0}%", pct);
-            self.cpu_pct_labels[idx].set_style_color(color);
+            let pct_i = pct.round() as i32;
+            self.cpu_pct_labels[idx].set_style_color(usage_text_color(pct_i));
             self.cpu_pct_labels[idx].set(fb, &self.fonts, &pct_text);
         }
     }
 
-    fn usage_color(text: &str) -> u32 {
-        parse_percent(text)
-            .and_then(|p| USAGE_COLOR_LUT.get(p as usize).copied())
-            .unwrap_or(GRAY)
+    // -----------------------------------------------------------------------
+    // Text truncation helpers
+    // -----------------------------------------------------------------------
+
+    fn truncate_to_width(text: &str, max_width: f32, fonts: &Fonts, style: &TextStyle) -> String {
+        if fonts.measure(text, style) <= max_width {
+            return text.to_string();
+        }
+        let mut s = text.to_string();
+        while !s.is_empty() {
+            let candidate = format!("{}..", s);
+            if fonts.measure(&candidate, style) <= max_width {
+                return candidate;
+            }
+            s.pop();
+            while !s.is_empty() && !s.is_char_boundary(s.len()) {
+                s.pop();
+            }
+        }
+        "..".to_string()
     }
 
-    fn temp_color(text: &str) -> u32 {
-        parse_temp(text)
-            .and_then(|t| TEMP_COLOR_LUT.get(t as usize).copied())
-            .unwrap_or(GRAY)
+    // -----------------------------------------------------------------------
+    // Container state dot
+    // -----------------------------------------------------------------------
+
+    fn container_state_color(state: &str, status_unhealthy: bool) -> u32 {
+        if status_unhealthy || state == "dead" {
+            ALARM
+        } else if state == "running" {
+            OK
+        } else if state == "exited" {
+            GRAY
+        } else if matches!(state, "created" | "paused" | "restarting") {
+            CAUTION
+        } else {
+            GRAY
+        }
+    }
+
+    fn draw_state_dot(fb: &mut Framebuffer, row: &mut ContainerRow, color: u32) {
+        if row.dot_color == Some(color) {
+            return;
+        }
+        if row.dot_color.is_some() {
+            fill_ellipse(fb, row.dot_x, row.dot_y, 3, 3, row.bg);
+        }
+        fill_ellipse(fb, row.dot_x, row.dot_y, 3, 3, color);
+        row.dot_color = Some(color);
+    }
+
+    fn clear_state_dot(fb: &mut Framebuffer, row: &mut ContainerRow) {
+        if row.dot_color.is_some() {
+            fill_ellipse(fb, row.dot_x, row.dot_y, 3, 3, row.bg);
+            row.dot_color = None;
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Scroll track (only when total pages > 1)
+    // -----------------------------------------------------------------------
+
+    fn draw_scroll_track(&mut self, fb: &mut Framebuffer, offset: usize, total: usize) {
+        let total_pages = ((total + CONTAINER_PAGE_SIZE - 1) / CONTAINER_PAGE_SIZE).max(1);
+        if total_pages <= 1 {
+            // Erase a previously drawn track if the container count dropped.
+            if self.scroll_last_total != usize::MAX {
+                fill_rect(fb, 472, 126, 4, 160, BG);
+                self.scroll_last_offset = usize::MAX;
+                self.scroll_last_total = usize::MAX;
+            }
+            return;
+        }
+        if self.scroll_last_offset == offset && self.scroll_last_total == total {
+            return;
+        }
+
+        // Full redraw: erase, track, thumb.
+        fill_rect(fb, 472, 126, 4, 160, BG);
+        fill_rect(fb, 472, 126, 4, 160, SCROLL_TRACK);
+        let max_offset = total.saturating_sub(CONTAINER_PAGE_SIZE);
+        let thumb_h = (160 * CONTAINER_PAGE_SIZE / total).max(8);
+        let thumb_y = if max_offset == 0 {
+            126
+        } else {
+            126 + (160 - thumb_h) * offset / max_offset
+        };
+        fill_rect(fb, 472, thumb_y as i32, 4, thumb_h as i32, GRAY);
+
+        self.scroll_last_offset = offset;
+        self.scroll_last_total = total;
+    }
+
+    // -----------------------------------------------------------------------
+    // Temperature trend arrow + alarm mark
+    // -----------------------------------------------------------------------
+
+    fn update_temp_trend(&mut self, now: f32, temp: f32) {
+        self.temp_trend_history.push_back((now, temp));
+        while let Some(&(t, _)) = self.temp_trend_history.front() {
+            if now - t > TEMP_TREND_WINDOW_SECS {
+                self.temp_trend_history.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn evaluate_temp_trend(&self, now: f32) -> (TrendState, bool) {
+        if self.temp_trend_history.len() < 2 {
+            return (TrendState::None, false);
+        }
+        let current = self.temp_trend_history.back().unwrap().1;
+        let alarm = current >= 80.0;
+        let target = now - TEMP_TREND_COMPARE_SECS;
+        let mut old = None;
+        for &(t, v) in self.temp_trend_history.iter().rev() {
+            if t <= target {
+                old = Some(v);
+                break;
+            }
+        }
+        let old = old.unwrap_or(self.temp_trend_history.front().unwrap().1);
+        let delta = current - old;
+        let state = if delta >= TEMP_TREND_DEADBAND {
+            TrendState::Rising
+        } else if delta <= -TEMP_TREND_DEADBAND {
+            TrendState::Falling
+        } else {
+            TrendState::Steady
+        };
+        (state, alarm)
+    }
+
+    fn draw_temp_trend(
+        &mut self,
+        fb: &mut Framebuffer,
+        fonts: &Fonts,
+        x: i32,
+        baseline_y: i32,
+        color: u32,
+        state: TrendState,
+        alarm: bool,
+    ) {
+        if state == TrendState::None {
+            if let Some(last) = self.temp_trend_last_bbox {
+                fill_rect(fb, last.x1 as i32, last.y1 as i32, last.width() as i32, last.height() as i32, BG);
+                self.temp_trend_last_bbox = None;
+            }
+            self.temp_trend_last_state = TrendState::None;
+            self.temp_trend_last_alarm = false;
+            return;
+        }
+
+        let mut new_bbox = Rect::new(
+            x.max(0) as usize,
+            (baseline_y - 2).max(0) as usize,
+            (x + 7).max(0) as usize,
+            (baseline_y + 3).max(0) as usize,
+        );
+        let alarm_bbox = if alarm {
+            let style = TextStyle::new(13, ALARM, false);
+            let g = fonts.glyph_ref('!', &style);
+            let ax = x + 7 + 4;
+            let gx = ax + g.xmin;
+            let gy = baseline_y - g.ymin - g.height as i32 + 1;
+            Some(Rect::new(
+                gx.max(0) as usize,
+                gy.max(0) as usize,
+                (gx + g.width as i32).max(0) as usize,
+                (gy + g.height as i32).max(0) as usize,
+            ))
+        } else {
+            None
+        };
+        if let Some(ab) = alarm_bbox {
+            new_bbox = new_bbox.union(&ab);
+        }
+
+        if state == self.temp_trend_last_state
+            && alarm == self.temp_trend_last_alarm
+            && self.temp_trend_last_bbox == Some(new_bbox)
+        {
+            return;
+        }
+
+        if let Some(last) = self.temp_trend_last_bbox {
+            fill_rect(fb, last.x1 as i32, last.y1 as i32, last.width() as i32, last.height() as i32, BG);
+        }
+
+        match state {
+            TrendState::Rising => Self::draw_up_arrow(fb, x, baseline_y, color),
+            TrendState::Falling => Self::draw_down_arrow(fb, x, baseline_y, color),
+            TrendState::Steady => Self::draw_steady_bar(fb, x, baseline_y, color),
+            TrendState::None => {}
+        }
+        if alarm {
+            fonts.draw(fb, "!", x + 7 + 4, baseline_y, &TextStyle::new(13, ALARM, false));
+        }
+
+        self.temp_trend_last_state = state;
+        self.temp_trend_last_alarm = alarm;
+        self.temp_trend_last_bbox = Some(new_bbox);
+    }
+
+    fn draw_up_arrow(fb: &mut Framebuffer, x: i32, baseline_y: i32, color: u32) {
+        for row in 0..5 {
+            let y = baseline_y - 2 + row;
+            let w = if row <= 2 { 2 * row + 1 } else { 7 };
+            let start_x = x + (7 - w) / 2;
+            fill_rect(fb, start_x, y, w, 1, color);
+        }
+    }
+
+    fn draw_down_arrow(fb: &mut Framebuffer, x: i32, baseline_y: i32, color: u32) {
+        for row in 0..5 {
+            let y = baseline_y - 2 + row;
+            let w = if row >= 2 { 2 * (4 - row) + 1 } else { 7 };
+            let start_x = x + (7 - w) / 2;
+            fill_rect(fb, start_x, y, w, 1, color);
+        }
+    }
+
+    fn draw_steady_bar(fb: &mut Framebuffer, x: i32, baseline_y: i32, color: u32) {
+        fill_rect(fb, x, baseline_y - 1, 7, 2, color);
     }
 }
 
@@ -345,6 +638,12 @@ impl Page for MonitorPage {
         self.bg_done = false;
         self.last_slow_render = -1000.0;
         self.container_scroll_offset = 0;
+        self.temp_trend_history.clear();
+        self.temp_trend_last_state = TrendState::None;
+        self.temp_trend_last_alarm = false;
+        self.temp_trend_last_bbox = None;
+        self.scroll_last_offset = usize::MAX;
+        self.scroll_last_total = usize::MAX;
         fb.mark_full_dirty();
     }
 
