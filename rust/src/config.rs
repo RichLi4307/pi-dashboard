@@ -84,7 +84,7 @@ pub const MONO_FONT_PATHS: &[&str] = &[
 
 pub const REFRESH_INTERVAL_MS: u64 = 67; // ~15 FPS, within 48 MHz SPI headroom
 pub const SLOW_RENDER_INTERVAL: f32 = 1.0;
-pub const SLOW_DATA_INTERVAL: f32 = 2.0;
+pub const SLOW_DATA_INTERVAL: f32 = 5.0;
 pub const CPU_SMOOTH_WINDOW: usize = 5;  // shorter smoothing at higher FPS; jumps + avg coexist
 pub const BOOT_TIMEOUT: u64 = 30;
 

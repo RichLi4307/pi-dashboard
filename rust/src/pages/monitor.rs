@@ -576,7 +576,11 @@ impl MonitorPage {
                 let cpu_text = match c.cpu {
                     Some(pct) => {
                         row.cpu.set_style_color(usage_text_color(pct.round() as i32));
-                        format!("{:.1}%", pct)
+                        if pct >= 100.0 {
+                            "100%".to_string()
+                        } else {
+                            format!("{:.1}%", pct)
+                        }
                     }
                     None => {
                         row.cpu.set_style_color(GRAY);
@@ -921,14 +925,14 @@ mod tests {
             ips: vec!["192.168.1.250".into(), "100.118.236.1".into()],
             tailscale: "ON".into(),
             containers: vec![
-                ContainerInfo { name: "astrbot".into(), status: "Up 15 hours".into(), state: "running".into(), cpu: Some(0.8) },
-                ContainerInfo { name: "napcat".into(), status: "Up 15 hours".into(), state: "running".into(), cpu: Some(0.1) },
-                ContainerInfo { name: "homeassistant".into(), status: "Up 3 hours".into(), state: "running".into(), cpu: Some(2.1) },
-                ContainerInfo { name: "pi-dashboard-mcp".into(), status: "Up 3 hours".into(), state: "running".into(), cpu: None },
-                ContainerInfo { name: "github-proxy".into(), status: "Up 30 hours".into(), state: "running".into(), cpu: Some(0.0) },
-                ContainerInfo { name: "hass-mcp".into(), status: "Up 30 hours".into(), state: "running".into(), cpu: Some(0.0) },
-                ContainerInfo { name: "mcp-python-sandbox".into(), status: "Up 18 hours".into(), state: "running".into(), cpu: Some(0.5) },
-                ContainerInfo { name: "exited-demo".into(), status: "Exited (0) 3 hours ago".into(), state: "exited".into(), cpu: Some(0.0) },
+                ContainerInfo { name: "astrbot".into(), id: "a1".into(), status: "Up 15 hours".into(), state: "running".into(), cpu: Some(0.8) },
+                ContainerInfo { name: "napcat".into(), id: "a2".into(), status: "Up 15 hours".into(), state: "running".into(), cpu: Some(0.1) },
+                ContainerInfo { name: "homeassistant".into(), id: "a3".into(), status: "Up 3 hours".into(), state: "running".into(), cpu: Some(2.1) },
+                ContainerInfo { name: "pi-dashboard-mcp".into(), id: "a4".into(), status: "Up 3 hours".into(), state: "running".into(), cpu: None },
+                ContainerInfo { name: "github-proxy".into(), id: "a5".into(), status: "Up 30 hours".into(), state: "running".into(), cpu: Some(0.0) },
+                ContainerInfo { name: "hass-mcp".into(), id: "a6".into(), status: "Up 30 hours".into(), state: "running".into(), cpu: Some(0.0) },
+                ContainerInfo { name: "mcp-python-sandbox".into(), id: "a7".into(), status: "Up 18 hours".into(), state: "running".into(), cpu: Some(0.5) },
+                ContainerInfo { name: "exited-demo".into(), id: "a8".into(), status: "Exited (0) 3 hours ago".into(), state: "exited".into(), cpu: Some(0.0) },
             ],
             disk: "11%".into(),
             temp: "63C".into(),

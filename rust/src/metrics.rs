@@ -6,6 +6,7 @@
 //!   task and publishes a `watch::Sender<MetricsSnapshot>`.
 
 use std::collections::{HashMap, VecDeque};
+use std::sync::LazyLock;
 use std::time::Duration;
 
 use tokio::process::Command;
@@ -20,9 +21,53 @@ use crate::config::{
 #[derive(Clone, Default, Debug)]
 pub struct ContainerInfo {
     pub name: String,
+    pub id: String,
     pub status: String,
     pub state: String,
     pub cpu: Option<f32>,
+}
+
+/// CPU sampler for Docker containers via cgroup v2 `cpu.stat`.
+/// Holds the last (timestamp, usage_usec) per container name.
+#[derive(Default)]
+struct ContainerCpuSampler {
+    last: HashMap<String, (std::time::Instant, u64)>,
+}
+
+impl ContainerCpuSampler {
+    fn new() -> Self {
+        Self {
+            last: HashMap::new(),
+        }
+    }
+
+    fn compute(&mut self, name: &str, id: &str, now: std::time::Instant) -> Option<f32> {
+        let usage = Self::read_usage_usec(id)?;
+        let pct = if let Some((prev_time, prev_usage)) = self.last.get(name) {
+            let dt = now.duration_since(*prev_time).as_micros() as f64;
+            let du = usage.saturating_sub(*prev_usage) as f64;
+            if dt > 0.0 {
+                Some((100.0 * du / dt) as f32)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        self.last.insert(name.to_string(), (now, usage));
+        pct
+    }
+
+    fn read_usage_usec(id: &str) -> Option<u64> {
+        let path = format!("/sys/fs/cgroup/system.slice/docker-{}.scope/cpu.stat", id);
+        let text = std::fs::read_to_string(&path).ok()?;
+        for line in text.lines() {
+            if let Some(v) = line.strip_prefix("usage_usec ") {
+                return v.parse::<u64>().ok();
+            }
+        }
+        None
+    }
 }
 
 /// Abbreviate a docker `Status` string for the dashboard container list.
@@ -326,7 +371,7 @@ pub async fn get_ip_list() -> Vec<String> {
 pub async fn read_docker_containers() -> Vec<ContainerInfo> {
     let out = match run_command(
         "docker",
-        &["ps", "-a", "--format", "{{.Names}}|{{.Status}}|{{.State}}"],
+        &["ps", "-a", "--no-trunc", "--format", "{{.Names}}|{{.ID}}|{{.Status}}|{{.State}}"],
         3.0,
     )
     .await
@@ -336,59 +381,47 @@ pub async fn read_docker_containers() -> Vec<ContainerInfo> {
     };
     let mut containers = Vec::new();
     for line in out.lines() {
-        let parts: Vec<&str> = line.splitn(3, '|').collect();
-        if parts.len() != 3 {
+        let parts: Vec<&str> = line.splitn(4, '|').collect();
+        if parts.len() != 4 {
             continue;
         }
         containers.push(ContainerInfo {
             name: parts[0].to_string(),
-            status: parts[1].to_string(),
-            state: parts[2].to_string(),
+            id: parts[1].to_string(),
+            status: parts[2].to_string(),
+            state: parts[3].to_string(),
             cpu: None,
         });
     }
     containers
 }
 
-/// Read per-container CPU% from `docker stats`. Returns a map name -> percent.
-async fn read_container_cpu() -> Option<HashMap<String, f32>> {
-    let out = run_command(
-        "docker",
-        &["stats", "--no-stream", "--format", "{{.Name}}\t{{.CPUPerc}}"],
-        5.0,
-    )
-    .await?;
-    let mut map = HashMap::new();
-    for line in out.lines() {
-        let parts: Vec<&str> = line.split('\t').collect();
-        if parts.len() != 2 {
-            continue;
-        }
-        let name = parts[0].trim().to_string();
-        let pct = parts[1]
-            .trim()
-            .trim_end_matches('%')
-            .parse::<f32>()
-            .ok()?;
-        map.insert(name, pct);
-    }
-    Some(map)
-}
+/// Global container CPU sampler. Since metrics runs on a single tokio
+/// current_thread runtime, a Mutex is sufficient and contention-free.
+static CONTAINER_CPU_SAMPLER: LazyLock<std::sync::Mutex<ContainerCpuSampler>> =
+    LazyLock::new(|| std::sync::Mutex::new(ContainerCpuSampler::new()));
 
-/// Join freshly fetched container list with CPU data. On stats failure, reuse
-/// CPU values from `prev` containers when names match.
+/// Join freshly fetched container list with CPU data read from cgroup v2.
+/// Falls back to the previous sample's CPU if cgroup is not yet readable.
 pub async fn read_docker_containers_with_cpu(prev: &[ContainerInfo]) -> Vec<ContainerInfo> {
     let mut containers = read_docker_containers().await;
-    let cpu_map = read_container_cpu().await;
-    let prev_map: HashMap<String, f32> = prev
-        .iter()
-        .filter_map(|c| c.cpu.map(|cpu| (c.name.clone(), cpu)))
-        .collect();
+    let now = std::time::Instant::now();
+    let mut sampler = match CONTAINER_CPU_SAMPLER.lock() {
+        Ok(g) => g,
+        Err(_) => {
+            // Lock poisoned: fall back to stale values.
+            let prev_map: HashMap<String, f32> = prev
+                .iter()
+                .filter_map(|c| c.cpu.map(|cpu| (c.name.clone(), cpu)))
+                .collect();
+            for c in &mut containers {
+                c.cpu = prev_map.get(&c.name).copied();
+            }
+            return containers;
+        }
+    };
     for c in &mut containers {
-        c.cpu = cpu_map
-            .as_ref()
-            .and_then(|m| m.get(&c.name).copied())
-            .or_else(|| prev_map.get(&c.name).copied());
+        c.cpu = sampler.compute(&c.name, &c.id, now);
     }
     containers
 }
