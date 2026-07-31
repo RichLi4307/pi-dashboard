@@ -189,9 +189,9 @@ test text::tests::zero_width_text_no_dirty ... ok
 - 同行字符基线对齐已修复，无跨帧跳动。
 - 文本重绘擦除机制已修复，无残影/糊边。
 - 脏区驱动刷新生效，静止时 SPI 写入量远小于全屏。
-- docker 面板 `m` 模糊已修复（Regular 10 px）。
-- 性能达标：CPU 1.65%，温度 ~56°C，内存 ~13 MB。
-- 无 git 操作执行。
+- docker 面板 `m` 模糊已修复（最终方案：**size 11 Regular**，size 10 在所有字重下均不可读）。
+- 性能达标：CPU 1.65% → 1.83%（15 FPS），温度 ~56°C，内存 ~11 MB。
+- 无 git 操作执行（后续按用户要求已 commit/push）。
 
 ---
 
@@ -238,3 +238,15 @@ pidstat 1 60 -p $(systemctl show --property=MainPID --value pi-dashboard.service
 
 - 48 MHz SPI 理论全屏上限约 19 FPS；如继续追求 20 FPS，需把 `REFRESH_INTERVAL_MS` 降到 50 ms，并观察是否有偶发撕裂。
 - 当前 15 FPS 是性能、稳定性、SPI 带宽余量的折中。
+
+---
+
+## 10. 架构师审阅摘要
+
+完整架构师报告见 `architect-review-2026-07-31.md`，要点：
+
+- 当前架构符合原设计：Page 抽象保留、`main.rs` 无 monitor 专属逻辑、console 模式已彻底清理。
+- 字号定案：size 10 在 480×320 面板上不可读，最小字号为 **11 px Regular**。
+- 字重定案：仅保留 **Regular**（小字）+ **Medium**（标题/正文）。
+- 性能/刷新：48 MHz SPI + 15 FPS，CPU 1.83%，脏区刷新诚实有效。
+- 待确认：是否扩展第二页指标、是否保留 48 MHz/15 FPS、是否未来扩展多字重。
