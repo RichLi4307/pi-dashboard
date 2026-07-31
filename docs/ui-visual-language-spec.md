@@ -1,132 +1,145 @@
-# Pi Dashboard 视觉语言规范（monitor 页整改指令）
+# Pi Dashboard 视觉语言规范 v2（monitor 页重设计指令）
 
-> 架构师/UI 定稿，2026-07-31。来源：用户评审反馈（温度趋势、语义配色、状态缩写、行间对比度、视觉语言统一）。
-> 本文档色号与坐标均为**定案**，coder 照此实施；只改 `config.rs` / `monitor.rs`（必要时 `metrics.rs` 加解析函数），不动架构、不加依赖。
+> 架构师/UI 定稿 v2，2026-07-31。取代 v1 同名规范（v1 中"常态值中性白"与三列布局已被用户修订）。
+> 用户已审核决策：① 健康绿配色方案；② Docker 表加第四列 CPU%，名称列多留、枚举列精确预留；③ 趋势箭头独立红蓝色。
+> 色号与坐标均为定案。只动 `config.rs` / `monitor.rs` / `metrics.rs` / `render.rs`（加圆角原语），不动架构。
 
-## 1. 设计原则（统一视觉语言的总纲）
+## 1. 语义色体系（v2 修订：健康绿合法化）
 
-**颜色即语义，不作装饰。** 全屏只允许四类颜色角色：
+**颜色即语义，不作装饰。** v1 铁律"非警告不用警告色"保留，但澄清：绿/蓝是**状态色**不是警告色，常态值允许且应当使用。
 
-| 角色 | 用途 | 色号 |
-|---|---|---|
-| 中性 | 数值、正文（WHITE `#e6edf3`）；标签、次要信息（GRAY `#7d8590`） | 现有 |
-| 标识 | 静态身份信息：主机名、IP（CYAN `#39c5cf`） | 现有 |
-| 状态 | OK=GREEN `#3fb950`；CAUTION=AMBER `#d29922`；过渡橙=ORANGE `#f0883e` | 现有 |
-| 报警 | ALARM **`#ff0000`**（用户指定，取代 `#f85149` 作为唯一报警色） | **新增常量** |
+| 语义 | 常量 | 色号 | 用途 |
+|---|---|---|---|
+| 中性正文 | WHITE | `#e6edf3` | 时间、名称、标题 |
+| 次要/标签 | GRAY | `#7d8590` | 表头、单位、页码、底栏 |
+| 标识信息 | CYAN | `#39c5cf` | 主机名、IP |
+| 健康/正常 | OK | `#3fb950` | 正常温度、低负载、running、TS:ON |
+| 低温/趋势降 | COOL | `#58a6ff` | <50°C、温度下降趋势 |
+| 注意 | CAUTION | `#d29922` | 65–74°C、用量 80–89%、过渡态容器 |
+| 预警 | ORANGE | `#f0883e` | 75–79°C |
+| 报警 | ALARM | `#ff0000` | ≥80°C、用量 ≥90%、unhealthy/dead、TS:OFF |
+| 趋势升 | TREND_HOT | `#f85149` | 温度上升趋势（柔红，与 ALARM 区分） |
 
-铁律：**不表示警告的文字一律不使用警告色**。数值默认中性色（WHITE），只有突破阈值才变色（见 §3/§4 阈值表）。已停容器、正常运行时间等不是警告，不得用红/黄。
-
-在 `config.rs` 新增语义别名常量，页面代码只许引用语义名，禁止散落裸色号：
+数值配色函数（均配边界单测）：
 
 ```rust
-pub const OK: u32 = GREEN;          // 0x3fb950
-pub const CAUTION: u32 = YELLOW;    // 0xd29922
-pub const ALARM: u32 = 0xff0000;    // 新增，唯一报警色
-pub const COOL: u32 = BLUE;         // 0x58a6ff，低温/信息蓝
-pub const ROW_STRIPE: u32 = 0x131a24;   // 斑马条，介于 BG 与 PANEL 之间
-pub const SCROLL_TRACK: u32 = 0x21262e; // 滚动轨道
+// 温度：全区间有颜色，颜色即档位
+temp_band_color(t): <50 COOL | 50..=64 OK | 65..=74 CAUTION | 75..=79 ORANGE | >=80 ALARM
+// 用量（CPU/MEM/DISK/容器CPU%）：
+usage_text_color(p): <80 OK | 80..=89 CAUTION | >=90 ALARM
 ```
 
-> 关于"50°C 是否 `#0000FF`"：纯蓝 `#0000FF` 在深色底上亮度过低、几乎不可读，否决。低温用调色板蓝 `#58a6ff`。
+`config.rs` 只维护这一份语义常量表，页面代码禁止裸色号。
 
-## 2. 温度：分档 + 趋势箭头 + 报警标志
+## 2. 布局总图（480×320，8px 网格）
 
-### 2.1 分档配色（替换 TEMP_GRADIENT/TEMP_COLOR_LUT，删除渐变）
+设计原则：**边距 12、右缘 468 对齐一切；层级 16/13/11 三级字阶；圆角几何（卡片 r4、条形全圆角）；用留白分区，不用分割线堆砌**。
 
-Pi 4B 85°C 降频，原 25–90 渐变在 56°C 常态区几乎不变色、报警区过晚。改为硬分档：
+```text
+y=0    ┌──────────────────────────────────────────────┐
+       │ 顶栏 PANEL：host(12,8)   [TS chip]  时间(右468) │  0..32
+y=40   │ ┌─TEMP─────┐ ┌─MEM──────┐ ┌─DISK─────┐        │  hero 卡 40..80
+       │ │ 56C ▲    │ │ 41%      │ │ 11%      │        │  x=12/167/322, w=146
+y=88   │                                              │
+       │ CPU0 ▓▓▓▓▓░░░░░  58%   CPU1 ▓▓▓▓▓▓▓░░  97%   │  行 y=100
+       │ CPU2 ▓░░░░░░░░░  12%   CPU3 ░░░░░░░░░   0%   │  行 y=126
+y=156  │ NAME              1/2   UPTIME  STATE   CPU  │  表头(右对齐 264/336/416/456)
+       │ ─────────────────────────────────────────── │  下划线 y=172
+y=176  │ ● astrbot            15h  running    0.8% ▏  │  8 行 × 14 = 176..288
+       │ ● homeassistant       15h  running    2.1% ▏  │  斑马 + 滚动轨道 x460..463
+y=300  │ 底栏 PANEL：Powered by RichLi4307    15 FPS   │  300..320
+       └──────────────────────────────────────────────┘
+```
 
-| 温度 | 颜色 | 语义 |
-|---|---|---|
-| < 50°C | COOL `#58a6ff` | 偏凉 |
-| 50–64 | WHITE | 正常工况（本机常态 ~56°C） |
-| 65–74 | CAUTION `#d29922` | 偏热，关注 |
-| 75–79 | ORANGE `#f0883e` | 高热，预警 |
-| ≥ 80 | ALARM `#ff0000` + 报警标志 | 报警 |
+## 3. 顶栏（y 0..32，PANEL）
 
-实现为 `pub fn temp_band_color(t: i32) -> u32`，配单元测试覆盖边界（49/50/64/65/74/75/79/80）。
+- host：`(12, 8)`，16 Medium CYAN。
+- time：16 Medium WHITE，**右对齐右缘 468**（"23:59:59" ≈ 77px，x≈391）。
+- **TS chip**（新几何元素）：圆角 pill（r9，描边 ACCENT，PANEL 底），h=18，y=7，右缘 383（与时间左缘隔 8px）。内容：r3 状态点 + "TS" 11px。ON=OK 绿、OFF=ALARM 红（点与文字同色）。
+- host 与 time 之间不再放 TS 文字，顶栏只三个元素，左右锚定。
 
-### 2.2 趋势箭头
+## 4. Hero 指标卡（y 40..80）
 
-- **采样**：温度沿用快通道每帧读取（~15 Hz）；`MonitorPage` 在 1 Hz 慢节拍把当前温度压入 60 秒环形历史。
-- **判定**：当前值 vs 30 秒前样本，死区 ±1.0°C：Δ ≥ +1.0 升、≤ −1.0 降、其余平。常量：`TEMP_TREND_WINDOW_SECS=60`、`TEMP_TREND_COMPARE_SECS=30`、`TEMP_TREND_DEADBAND=1.0`。
-- **绘制**：字体为 ASCII 子集，**没有箭头字符，禁止为此换字体**。用几何原语画 7×5 小三角（升=上三角、降=下三角、平=短横杠 7×2），位置紧跟温度值右侧 4px，垂直居中对齐数值 baseline 中线。
-- **颜色**：与温度值同档色。历史不足 30 秒（启动初期）不画。
-- 做成与 Label 同纪律的小控件（记录上次状态与 bbox，状态不变零操作，变化先擦后画），不污染脏区机制。
+三张卡片：x=12 / 167 / 322，w=146（间距 9，右缘正好 468），h=40，PANEL 底、`fill_rounded_rect` r=4。
 
-### 2.3 报警标志
+- 卡内：标签 11 GRAY 于 `(x+10, y+8)`（"TEMP"/"MEM"/"DISK"）；值 16 Medium 于 `(x+10, y+23)`。
+- TEMP 值 = `"56C"`，颜色 `temp_band_color`；值右侧 4px 放趋势箭头（见 §7），报警时再右移放 ALARM `!`。
+- MEM/DISK 值只显示百分比（`"41%"`），颜色 `usage_text_color`；详细串（`3200/7801MB`）不上屏，IPC 数据不变。
 
-≥ 80°C 时在趋势箭头右侧追加 ALARM 色 `!`（ASCII，字体里有）；< 80 擦除。与趋势箭头合并为同一个 `TempTrend` 控件即可。
+## 5. CPU 区（2×2 网格）
 
-## 3. 用量类指标（CPU/MEM/DISK）配色
+- 行 y=100、126；列 cell x=12、244（cell 宽 224）。
+- label "CPU0..3" 11 GRAY 于 `(cx, row)`。
+- 条：`fill_rounded_rect` 全圆角（r=5 pill），x=cx+38，y=row+1，w=151，h=10；轨道 ACCENT，填充保留 USAGE_LUT 渐变。
+- pct：11px，`usage_text_color`，**右对齐 cell 右缘**（236 / 468）。
+- 本区无标题、无框线，靠网格对齐自明。
 
-- 数值文字：`pub fn usage_text_color(pct: i32) -> u32` —— < 80% WHITE；80–89% CAUTION；≥ 90% ALARM。配边界单测。
-- CPU 百分比 Label、MEM/DISK 值 Label 全部改用此函数（替换 `usage_color` 里直接套 LUT 的做法）。
-- **CPU 进度条填充保留 USAGE_COLOR_LUT 渐变**——仪表条是量表惯例，不违反"非警告不用警告色"。
+## 6. Docker 表（四列定案）
 
-## 4. 容器列表
+### 6.1 列宽（用户定：名称列多留，枚举列按最大内容精确预留，右对齐）
 
-### 4.1 STATUS 列缩写（`metrics.rs` 新增 `abbreviate_status(&str) -> String` + 单测）
+区块 x=12..468（滚动轨道占据时内容右缘 456，轨道 x=460..463）。
 
-| docker 原始 | 显示 |
-|---|---|
-| `Up 45 seconds` / `Up 1 second` | `45s` / `1s` |
-| `Up N minutes/hours/days/weeks` | `Nm` / `Nh` / `Nd` / `Nw` |
-| `Up N months` / `Up N years` | `Nmo` / `Ny` |
-| `Up About an hour` | `1h`；`Up Less than a second` | `0s` |
-| `Up 2 hours (healthy)` | `2h`（丢弃 healthy 后缀） |
-| `Up 2 hours (unhealthy)` | `2h`，且 STATE 圆点与文字转 ALARM |
-| `Exited (0) 3 hours ago` | `Ex0 3h`（其他退出码同理 `Ex137 5m`） |
-| `Restarting (1) 5 seconds ago` | `Rst 5s` |
-| `Created` / `Paused` | `New` / `Paus` |
-| 其他无法解析 | 原样，按列宽截断 |
+| 列 | 内容上限 | 预留 | 对齐 | x 范围 |
+|---|---|---|---|---|
+| NAME | 截断 `..` | 剩余全部 ≈238px（~36 字符） | 左，x=26（左侧 r3 状态点于 x=16） | 26..264 |
+| UPTIME | `Ex137 59m` 9 字符 | 64px | 右对齐 336 | 272..336 |
+| STATE | `restarting` 10 字符 | 72px | 右对齐 416 | 344..416 |
+| CPU | `100%` 4 字符 | 40px | 右对齐 456 | 416..456 |
 
-STATUS 列文字固定中性 GRAY（运行时间不是警告）；unhealthy 的报警表达只落在 STATE 列与圆点。
+- 表头：11 GRAY，与数据列同对齐（NAME 左 x=26；其余右对齐 336/416/456），文案 `NAME / UPTIME / STATE / CPU`。
+- 页码 `1/2` 11 GRAY 放表头行，右对齐 264（NAME 列右缘），总页数 ≤1 时不显示。
+- 下划线 y=172，x=12..468，ACCENT。
 
-### 4.2 STATE 列配色（替换现有 match）
+### 6.2 行
 
-| state | 颜色 | 理由 |
-|---|---|---|
-| running | OK | 健康 |
-| exited | **GRAY** | 正常终止，非警告（原 RED 违反铁律，必改） |
-| created / paused / restarting | CAUTION | 过渡态 |
-| dead，或 status 含 `(unhealthy)` | ALARM | 真异常 |
+- `CONTAINER_PAGE_SIZE` 10→**8**，`DOCKER_LINE_HEIGHT` 16→**14**，行 y=176..288（为几何留白让位）。
+- 斑马：奇数行 `ROW_STRIPE`，x=12..456；该行所有 Label 的 `bg` 同步为 `ROW_STRIPE`（v1 已踩过的坑，不得复发）。
+- 状态点：r=3，`(16, row+7)`，颜色与 STATE 文字一致。
+- 滚动轨道（页数 >1）：x=460..463，y=176..288，`SCROLL_TRACK` 底 + GRAY 滑块，比例/定位同 v1 公式（区块高 112）。
 
-圆点颜色与 STATE 文字一致。
+### 6.3 内容规则
 
-### 4.3 行间区分：斑马条 + 结构线（像素级定案）
+- UPTIME 列：`abbreviate_status`（映射表沿用 v1 §4.1：`Up 15 hours`→`15h`、`Exited (0) 3 hours ago`→`Ex0 3h`、`Restarting (1) 5s ago`→`Rst 5s` 等），恒 GRAY。
+- STATE 列：running=OK、exited=GRAY、created/paused/restarting=CAUTION、dead 或 unhealthy=ALARM。
+- CPU 列：容器实时 CPU%，`usage_text_color`；数据不可用时显示 `-`（GRAY）。
 
-docker 区块视觉边界统一为 **x=4..476，y=108..286**；任何装饰元素不得超出此范围，也不得压表头（y=108）与底栏（y≥300）。
+### 6.4 数据层（metrics.rs）
 
-- **斑马条**：10 个行带 `y = 126 + 16*i`（i=0..9）高 16，奇数行填 `ROW_STRIPE`，偶数行保持 `BG`；x 范围 4..470。在静态背景阶段绘制，零每帧开销。
-- **Label 背景同步**：奇数行的 name/status/state 三个 Label 的 `bg` 必须设为 `ROW_STRIPE`（否则 clear 会在斑马条上打出 BG 色洞）。这是最容易漏的点。
-- **表头下划线**：`draw_line_h(4, 470, DOCKER_LIST_Y - 3, ACCENT)`，与斑马条同左右边界。
-- **滚动轨道**（仅当总页数 > 1）：轨道 x=472..475、y=126..286 填 `SCROLL_TRACK`；滑块 GRAY，高 `max(8, 160 * CONTAINER_PAGE_SIZE / total)`，顶端 `126 + (160 - thumb_h) * offset / max_offset`。慢节拍重绘时先按 BG 擦除该列再画。轨道右缘 476 即区块右边界，与斑马条右缘 470 对齐成一条视觉边。
-- 页码 Label 位置不变（x=420, y=126），颜色由 YELLOW 改 GRAY（页码不是警告）。
+- `ContainerInfo` 增加第 4 字段 `cpu: Option<f32>`。
+- 慢通道在容器列表周期内追加一次 `docker stats --no-stream --format '{{.Name}}\t{{.CPUPerc}}'`（单命令全容器，tokio timeout 5s），按名字 join 进 ContainerInfo；失败保留旧值。
+- 触摸滚动区改为 y=156..288；IPC `scroll_containers` 逻辑不变（max_offset 随 PAGE_SIZE=8 重算）。
 
-### 4.4 列宽与截断（顺手关闭已知风险"容器名溢出"）
+## 7. 温度趋势箭头（v2 修订：颜色独立于温度档）
 
-- name 列可用宽 = 175 − 20 − 4 = 151px（11px Regular 约 22 字符）；超长截断并以 `..` 结尾。
-- status 缩写后最长约 8 字符，state 最长 10 字符，均不超列；截断逻辑对三列统一实现（按 measure 宽度截，不按字符数）。
+- 采样/判定不变：1 Hz 压入 60s 环形历史，与 30s 前比较，死区 ±1.0°C（常量 `TEMP_TREND_*` 沿用 v1）。
+- **符号升级**：8×6 三角形（升=上三角、降=下三角、平=8×2 横杠），比 v1 的 7×5 更醒目。
+- **颜色独立**（用户指定蓝红区分）：升 `TREND_HOT #f85149`、降 `COOL #58a6ff`、平 GRAY——与温度值自身的档位色**无关**。
+- 位置：hero TEMP 卡内，值右 4px，垂直对齐值的视觉中线。
+- 与 Label 同纪律：状态不变零操作，变化先擦（用自己卡片背景 PANEL）后画。
 
-## 5. 其余区域维持现状
+## 8. 新增渲染原语（render.rs）
 
-顶栏（host CYAN / time WHITE / TS ON=OK、OFF=ALARM）、IP 行 CYAN、TEMP/MEM/DISK 标签 GRAY、底栏 GRAY、分隔线 ACCENT——均已符合语义规则，不动。
+- `fill_rounded_rect(fb, x, y, w, h, r, color)`：圆角矩形（矩形+四角椭圆合成或扫描线），写前比较、诚实标脏；w<2r 时退化为椭圆/矩形。
+- `fill_triangle(fb, cx, cy, w, h, up: bool, color)`：实心等腰三角形。
+- 两者配单元测试（bbox 正确、脏区正确）。
 
-## 6. 约束
+## 9. 约束
 
-1. 零新增 crate；只动 `config.rs`、`monitor.rs`、`metrics.rs`（缩写解析）。
-2. 遵守渲染纪律：斑马条/结构线进静态背景；滚动轨道与 TempTrend 控件走"值变化才擦除重绘"；禁止任何 blanket `mark_dirty`。
-3. 所有配色经语义常量引用；`temp_band_color` / `usage_text_color` / `abbreviate_status` 必须有单元测试（含边界值）。
-4. 性能不退化：pidstat 复测 CPU ≤ 4%；静止帧 SPI 写入量与当前基线（1.3–5.5 KB）同量级。
-5. 更新 headless 黄金图，交付前后对比截图（重点：温度区、容器列表区）。
-6. git 操作遵循 `~/.kimi-code/AGENTS.md` 六.9 分级约束。
+1. 零新增 crate；只动 `config.rs`/`render.rs`/`metrics.rs`/`monitor.rs`。
+2. 渲染纪律不变：静态元素（卡片底、斑马、下划线、轨道底）进静态背景；动态控件值变化才擦除重绘；禁止 blanket `mark_dirty`。
+3. 语义常量引用制；`temp_band_color`/`usage_text_color`/`abbreviate_status`/新原语均有单测。
+4. 所有右对齐用 `measure` 实宽计算，禁止手估字符宽度。
+5. 性能：CPU ≤ 4%；`docker stats` 只在慢通道周期执行一次且带 timeout；静止帧 SPI 写入量与基线（1.3–5.5 KB）同量级。
+6. 更新 headless 黄金图与 `CONTAINER_PAGE_SIZE` 相关测试；git 遵循 AGENTS.md 六.9。
 
-## 7. 验收清单
+## 10. 验收清单
 
-- [ ] 56°C 常态温度显示 WHITE；< 50 蓝、65–74 琥珀、75–79 橙、≥ 80 纯红 + `!`
-- [ ] 温度趋势箭头在升温/降温/平稳三态正确切换，启动 30 秒内不显示
-- [ ] CPU 5% 与 95% 的百分比文字分别为 WHITE / ALARM
-- [ ] `Up 15 hours` → `15h`，`Exited (0) 3 hours ago` → `Ex0 3h`，exited 不再红色
-- [ ] 斑马条只出现在 x=4..470、y=126..286；滚动轨道 x=472..475；无元素越出 docker 区块
-- [ ] 奇数行 Label 擦除后无 BG 色洞
-- [ ] `cargo test --release` 全绿；截图 A/B 交付
+- [ ] 56°C 显示 OK 绿 + 趋势箭头（升温柔红/降温蓝/平稳灰杠），≥80°C 纯红 + `!`
+- [ ] 内存/磁盘/CPU 常态绿、80–89 琥珀、≥90 纯红
+- [ ] hero 三卡右缘齐 468，圆角 r4；CPU 条全圆角，pct 右对齐
+- [ ] Docker 四列：名称截断 `..` 不越界；UPTIME/STATE/CPU 右缘分别齐 336/416/456
+- [ ] 表头 NAME/UPTIME/STATE/CPU，页码在表头行右对齐 264
+- [ ] 斑马 x=12..456、轨道 x=460..463，无任何元素越出 x=12..468
+- [ ] `Exited (0) 3 hours ago` → `Ex0 3h` 且为 GRAY
+- [ ] `cargo test --release` 全绿；pidstat ≤4%；前后截图 A/B 交付

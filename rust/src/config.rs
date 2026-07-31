@@ -32,6 +32,7 @@ pub const OK: u32 = GREEN;              // 0x3fb950
 pub const CAUTION: u32 = YELLOW;        // 0xd29922
 pub const ALARM: u32 = 0xff0000;        // user-specified alarm red
 pub const COOL: u32 = BLUE;             // 0x58a6ff
+pub const TREND_HOT: u32 = RED;         // 0xf85149, rising-temperature arrow
 pub const ROW_STRIPE: u32 = 0x131a24;   // zebra stripe between BG and PANEL
 pub const SCROLL_TRACK: u32 = 0x21262e; // container scroll track
 
@@ -91,11 +92,11 @@ pub const MODE_NAMES: &[&str] = &["monitor"];
 
 pub const TOUCH_POLL_INTERVAL_MS: u64 = 50;
 
-pub const CONTAINER_PAGE_SIZE: usize = 10;
-pub const DOCKER_START_Y: i32 = 108;
+pub const CONTAINER_PAGE_SIZE: usize = 8;
+pub const DOCKER_START_Y: i32 = 156;
 pub const DOCKER_HEADER_Y: i32 = DOCKER_START_Y;
-pub const DOCKER_LIST_Y: i32 = DOCKER_START_Y + 18;
-pub const DOCKER_LINE_HEIGHT: i32 = 16;
+pub const DOCKER_LIST_Y: i32 = 176;
+pub const DOCKER_LINE_HEIGHT: i32 = 14;
 
 pub const TOUCH_DEVICES: &[&str] = &[
     "/dev/input/event1",
@@ -184,12 +185,12 @@ pub fn parse_temp(text: &str) -> Option<i32> {
         .map(|v| v as i32)
 }
 
-/// Hard temperature band colour used for the temperature value and trend arrow.
+/// Hard temperature band colour used for the temperature value.
 pub fn temp_band_color(t: i32) -> u32 {
     if t < 50 {
         COOL
     } else if t < 65 {
-        WHITE
+        OK
     } else if t < 75 {
         CAUTION
     } else if t < 80 {
@@ -199,10 +200,10 @@ pub fn temp_band_color(t: i32) -> u32 {
     }
 }
 
-/// Usage percentage colour for numeric text labels (CPU/MEM/DISK).
+/// Usage percentage colour for numeric text labels (CPU/MEM/DISK/container CPU).
 pub fn usage_text_color(pct: i32) -> u32 {
     if pct < 80 {
-        WHITE
+        OK
     } else if pct < 90 {
         CAUTION
     } else {
@@ -229,8 +230,8 @@ mod tests {
     #[test]
     fn temp_band_color_boundaries() {
         assert_eq!(temp_band_color(49), COOL);
-        assert_eq!(temp_band_color(50), WHITE);
-        assert_eq!(temp_band_color(64), WHITE);
+        assert_eq!(temp_band_color(50), OK);
+        assert_eq!(temp_band_color(64), OK);
         assert_eq!(temp_band_color(65), CAUTION);
         assert_eq!(temp_band_color(74), CAUTION);
         assert_eq!(temp_band_color(75), ORANGE);
@@ -241,8 +242,8 @@ mod tests {
 
     #[test]
     fn usage_text_color_boundaries() {
-        assert_eq!(usage_text_color(0), WHITE);
-        assert_eq!(usage_text_color(79), WHITE);
+        assert_eq!(usage_text_color(0), OK);
+        assert_eq!(usage_text_color(79), OK);
         assert_eq!(usage_text_color(80), CAUTION);
         assert_eq!(usage_text_color(89), CAUTION);
         assert_eq!(usage_text_color(90), ALARM);

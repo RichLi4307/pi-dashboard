@@ -142,3 +142,136 @@ pub fn fill_ellipse(fb: &mut Framebuffer, cx: i32, cy: i32, rx: i32, ry: i32, co
         fb.mark_dirty(Rect::new(x1, y1, x2, y2));
     }
 }
+
+/// Draw a filled rounded rectangle with corner radius `r`.
+/// `r` is clamped to `min(w, h) / 2`. Only changed rows are marked dirty.
+pub fn fill_rounded_rect(fb: &mut Framebuffer, x: i32, y: i32, w: i32, h: i32, r: i32, color: u32) {
+    if w <= 0 || h <= 0 {
+        return;
+    }
+    let r = r.min(w / 2).min(h / 2).max(0);
+    let rgb565 = rgb888_to_rgb565(color);
+    let x1 = x.max(0) as usize;
+    let y1 = y.max(0) as usize;
+    let x2 = (x + w).min(W as i32).max(x1 as i32) as usize;
+    let y2 = (y + h).min(H as i32).max(y1 as i32) as usize;
+    let r2 = (r * r) as f32;
+    let mut changed = false;
+
+    for row in y1..y2 {
+        let dy = if row < (y + r) as usize {
+            (y + r) as i32 - row as i32
+        } else if row >= (y + h - r) as usize {
+            row as i32 - (y + h - 1 - r) as i32
+        } else {
+            0
+        };
+        let inset = if dy > 0 && dy <= r {
+            let dx = (r2 - (dy as f32).powi(2)).max(0.0).sqrt();
+            (r as f32 - dx).ceil() as i32
+        } else {
+            0
+        };
+        let xl = (x + inset).max(0) as usize;
+        let xr = (x + w - inset).min(W as i32).max(xl as i32) as usize;
+        if xl >= xr {
+            continue;
+        }
+        let start = row * W + xl;
+        let slice = &mut fb.buffer_mut()[start..start + (xr - xl)];
+        if !slice.iter().all(|&p| p == rgb565) {
+            slice.fill(rgb565);
+            changed = true;
+        }
+    }
+    if changed {
+        fb.mark_dirty(Rect::new(x1, y1, x2, y2));
+    }
+}
+
+/// Draw a filled isosceles triangle. `up` selects whether the apex points up.
+/// The bounding box is centred at `(cx, cy)` with width `w` and height `h`.
+pub fn fill_triangle(fb: &mut Framebuffer, cx: i32, cy: i32, w: i32, h: i32, up: bool, color: u32) {
+    if w <= 0 || h <= 0 {
+        return;
+    }
+    let rgb565 = rgb888_to_rgb565(color);
+    let y_top = cy - h / 2;
+    let y_bottom = y_top + h;
+    let y1 = y_top.max(0) as usize;
+    let y2 = y_bottom.min(H as i32).max(y_top) as usize;
+    let half_w = w as f32 / 2.0;
+    let half_h = h as f32 / 2.0;
+    let mut changed = false;
+
+    for row in y1..y2 {
+        let dy = if up {
+            row as i32 - y_top
+        } else {
+            y_bottom - 1 - row as i32
+        } as f32;
+        let ratio = (dy / half_h).clamp(0.0, 1.0);
+        let half = half_w * (1.0 - ratio);
+        let xl = ((cx as f32 - half).ceil() as i32).max(0) as usize;
+        let xr = ((cx as f32 + half).floor() as i32 + 1).min(W as i32).max(xl as i32) as usize;
+        if xl >= xr {
+            continue;
+        }
+        let start = row * W + xl;
+        let slice = &mut fb.buffer_mut()[start..start + (xr - xl)];
+        if !slice.iter().all(|&p| p == rgb565) {
+            slice.fill(rgb565);
+            changed = true;
+        }
+    }
+    if changed {
+        let x1 = (cx - w / 2).max(0) as usize;
+        let x2 = (cx + w / 2 + 1).min(W as i32).max(x1 as i32) as usize;
+        fb.mark_dirty(Rect::new(x1, y1, x2, y2));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn setup() -> Framebuffer {
+        Framebuffer::headless()
+    }
+
+    #[test]
+    fn rounded_rect_marks_dirty_bbox() {
+        let mut fb = setup();
+        fill_rounded_rect(&mut fb, 10, 10, 20, 20, 4, 0xffffff);
+        let r = fb.dirty_rects();
+        assert!(!r.is_empty());
+        let union = r.iter().fold(r[0], |a, b| a.union(b));
+        assert!(union.width() >= 20);
+        assert!(union.height() >= 20);
+    }
+
+    #[test]
+    fn rounded_rect_zero_size_no_dirty() {
+        let mut fb = setup();
+        fill_rounded_rect(&mut fb, 10, 10, 0, 20, 4, 0xffffff);
+        assert!(fb.dirty_rects().is_empty());
+    }
+
+    #[test]
+    fn triangle_marks_dirty_bbox() {
+        let mut fb = setup();
+        fill_triangle(&mut fb, 50, 50, 8, 6, true, 0xffffff);
+        let r = fb.dirty_rects();
+        assert!(!r.is_empty());
+        let union = r.iter().fold(r[0], |a, b| a.union(b));
+        assert!(union.width() >= 8);
+        assert!(union.height() >= 6);
+    }
+
+    #[test]
+    fn triangle_zero_size_no_dirty() {
+        let mut fb = setup();
+        fill_triangle(&mut fb, 50, 50, 0, 6, true, 0xffffff);
+        assert!(fb.dirty_rects().is_empty());
+    }
+}

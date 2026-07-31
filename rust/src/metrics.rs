@@ -17,7 +17,13 @@ use crate::config::{
     CPU_SMOOTH_WINDOW, IP_FILTER_ENABLED, SLOW_DATA_INTERVAL,
 };
 
-pub type ContainerInfo = (String, String, String);
+#[derive(Clone, Default, Debug)]
+pub struct ContainerInfo {
+    pub name: String,
+    pub status: String,
+    pub state: String,
+    pub cpu: Option<f32>,
+}
 
 /// Abbreviate a docker `Status` string for the dashboard container list.
 /// Parenthetical health suffixes `(healthy)` / `(unhealthy)` are stripped from
@@ -334,11 +340,55 @@ pub async fn read_docker_containers() -> Vec<ContainerInfo> {
         if parts.len() != 3 {
             continue;
         }
-        containers.push((
-            parts[0].chars().take(18).collect(),
-            parts[1].chars().take(40).collect(),
-            parts[2].to_string(),
-        ));
+        containers.push(ContainerInfo {
+            name: parts[0].to_string(),
+            status: parts[1].to_string(),
+            state: parts[2].to_string(),
+            cpu: None,
+        });
+    }
+    containers
+}
+
+/// Read per-container CPU% from `docker stats`. Returns a map name -> percent.
+async fn read_container_cpu() -> Option<HashMap<String, f32>> {
+    let out = run_command(
+        "docker",
+        &["stats", "--no-stream", "--format", "{{.Name}}\t{{.CPUPerc}}"],
+        5.0,
+    )
+    .await?;
+    let mut map = HashMap::new();
+    for line in out.lines() {
+        let parts: Vec<&str> = line.split('\t').collect();
+        if parts.len() != 2 {
+            continue;
+        }
+        let name = parts[0].trim().to_string();
+        let pct = parts[1]
+            .trim()
+            .trim_end_matches('%')
+            .parse::<f32>()
+            .ok()?;
+        map.insert(name, pct);
+    }
+    Some(map)
+}
+
+/// Join freshly fetched container list with CPU data. On stats failure, reuse
+/// CPU values from `prev` containers when names match.
+pub async fn read_docker_containers_with_cpu(prev: &[ContainerInfo]) -> Vec<ContainerInfo> {
+    let mut containers = read_docker_containers().await;
+    let cpu_map = read_container_cpu().await;
+    let prev_map: HashMap<String, f32> = prev
+        .iter()
+        .filter_map(|c| c.cpu.map(|cpu| (c.name.clone(), cpu)))
+        .collect();
+    for c in &mut containers {
+        c.cpu = cpu_map
+            .as_ref()
+            .and_then(|m| m.get(&c.name).copied())
+            .or_else(|| prev_map.get(&c.name).copied());
     }
     containers
 }
@@ -365,12 +415,12 @@ impl Metrics {
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
             // First refresh immediately.
-            let mut snap = Self::refresh_slow().await;
+            let mut snap = Self::refresh_slow(&MetricsSnapshot::default()).await;
             let _ = tx.send(snap.clone());
 
             loop {
                 ticker.tick().await;
-                snap = Self::refresh_slow().await;
+                snap = Self::refresh_slow(&snap).await;
                 let _ = tx.send(snap.clone());
             }
         });
@@ -381,11 +431,11 @@ impl Metrics {
         }
     }
 
-    async fn refresh_slow() -> MetricsSnapshot {
+    async fn refresh_slow(prev: &MetricsSnapshot) -> MetricsSnapshot {
         let (ips, tailscale, containers, disk) = tokio::join!(
             get_ip_list(),
             read_tailscale_status(),
-            read_docker_containers(),
+            read_docker_containers_with_cpu(&prev.containers),
             read_disk_usage(),
         );
         MetricsSnapshot {

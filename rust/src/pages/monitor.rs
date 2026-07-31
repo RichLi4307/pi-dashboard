@@ -1,7 +1,7 @@
-//! Monitor page: replicates `monitor_mode.py` layout and behaviour.
+//! Monitor page: visual language v2 layout.
 //!
-//! All mutable text fields are `Label` instances; only changed values redraw.
-//! CPU bars are `Bar` instances. Dirty regions are honest: no blanket marks.
+//! Static background is drawn once; all mutable fields are widgets that erase
+//! and redraw only on change. No blanket mark_dirty.
 
 use std::collections::VecDeque;
 use std::time::Instant;
@@ -10,16 +10,19 @@ use anyhow::Result;
 use time::OffsetDateTime;
 
 use crate::config::{
-    self, ACCENT, ALARM, BG, CAUTION, CONTAINER_PAGE_SIZE, CYAN, DOCKER_HEADER_Y,
-    DOCKER_LINE_HEIGHT, DOCKER_LIST_Y, DOCKER_START_Y, GRAY, GREEN, OK, PANEL, RED,
-    ROW_STRIPE, SCROLL_TRACK, SLOW_RENDER_INTERVAL, USAGE_COLOR_LUT, W, WHITE,
+    self, ACCENT, ALARM, BG, CAUTION, CONTAINER_PAGE_SIZE, COOL, CYAN,
+    DOCKER_HEADER_Y, DOCKER_LINE_HEIGHT, DOCKER_LIST_Y, GRAY, OK, PANEL,
+    ROW_STRIPE, SCROLL_TRACK, SLOW_RENDER_INTERVAL, TREND_HOT, USAGE_COLOR_LUT,
+    W, WHITE,
 };
 use crate::config::{parse_percent, parse_temp, temp_band_color, usage_text_color};
 use crate::fb::{Framebuffer, Rect};
-use crate::label::{Align, Bar, Label};
+use crate::label::{Align, Label};
 use crate::metrics::{abbreviate_status, ContainerInfo, MetricsSnapshot};
 use crate::pages::{Page, PageAction};
-use crate::render::{draw_line_h, fill_ellipse, fill_rect};
+use crate::render::{
+    draw_line_h, fill_ellipse, fill_rect, fill_rounded_rect, fill_triangle,
+};
 use crate::text::{FontWeight, Fonts, TextStyle};
 use crate::touch::TouchEvent;
 
@@ -27,17 +30,50 @@ const TEMP_TREND_WINDOW_SECS: f32 = 60.0;
 const TEMP_TREND_COMPARE_SECS: f32 = 30.0;
 const TEMP_TREND_DEADBAND: f32 = 1.0;
 
-/// A row of container labels: name, status, state, plus a state dot.
-struct ContainerRow {
-    name: Label,
-    status: Label,
-    state: Label,
-    bg: u32,
-    dot_x: i32,
-    dot_y: i32,
-    dot_color: Option<u32>,
-}
+// ---------------------------------------------------------------------------
+// Layout constants (480×320, 8 px grid).
+// ---------------------------------------------------------------------------
+const TOP_PANEL_H: i32 = 32;
+const HERO_CARD_X: [i32; 3] = [12, 167, 322];
+const HERO_CARD_W: i32 = 146;
+const HERO_CARD_H: i32 = 40;
+const HERO_CARD_Y: i32 = 40;
 
+const CPU_ROWS: [i32; 2] = [100, 126];
+const CPU_COLS: [i32; 2] = [12, 244];
+const CPU_CELL_RIGHT: [i32; 2] = [236, 468];
+const CPU_BAR_X_OFF: i32 = 38;
+const CPU_BAR_Y_OFF: i32 = 1;
+const CPU_BAR_W: i32 = 151;
+const CPU_BAR_H: i32 = 10;
+const CPU_BAR_R: i32 = 5;
+
+const DOCKER_RIGHT: i32 = 468;
+const DOCKER_TRACK_X: i32 = 460;
+const DOCKER_TRACK_W: i32 = 4;
+const DOCKER_CONTENT_RIGHT: i32 = 456;
+const DOCKER_ZEBRA_RIGHT: i32 = 456;
+const NAME_X: i32 = 26;
+const PAGE_RIGHT: i32 = 264;
+const UPTIME_RIGHT: i32 = 336;
+const STATE_RIGHT: i32 = 416;
+const CPU_RIGHT: i32 = 456;
+const UNDERLINE_Y: i32 = 172;
+const DOT_X: i32 = 16;
+
+const TS_CHIP_RIGHT: i32 = 383;
+const TS_CHIP_W: i32 = 46;
+const TS_CHIP_H: i32 = 18;
+const TS_CHIP_Y: i32 = 7;
+const TS_CHIP_R: i32 = 9;
+const TIME_RIGHT: i32 = 468;
+
+const TREND_W: i32 = 8;
+const TREND_H: i32 = 6;
+
+// ---------------------------------------------------------------------------
+// Temperature trend state.
+// ---------------------------------------------------------------------------
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum TrendState {
     None,
@@ -46,43 +82,236 @@ enum TrendState {
     Steady,
 }
 
+// ---------------------------------------------------------------------------
+// Tailscale status chip: rounded pill with state dot + "TS".
+// ---------------------------------------------------------------------------
+struct TsChip {
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    r: i32,
+    dot_x: i32,
+    dot_y: i32,
+    dot_r: i32,
+    text_x: i32,
+    text_baseline_y: i32,
+    text_style: TextStyle,
+    last_on: Option<bool>,
+    last_text_bbox: Option<Rect>,
+}
+
+impl TsChip {
+    fn new(x: i32, y: i32, w: i32, h: i32, r: i32, fonts: &Fonts) -> Self {
+        let dot_r = 3;
+        let dot_x = x + 8 + dot_r;
+        let dot_y = y + h / 2;
+        let text_x = dot_x + dot_r + 5;
+        let text_style = TextStyle::new(11, GRAY, false);
+        let text_baseline_y = fonts.baseline_y(y + (h - 11) / 2, &text_style);
+        Self {
+            x,
+            y,
+            w,
+            h,
+            r,
+            dot_x,
+            dot_y,
+            dot_r,
+            text_x,
+            text_baseline_y,
+            text_style,
+            last_on: None,
+            last_text_bbox: None,
+        }
+    }
+
+    fn draw(&mut self, fb: &mut Framebuffer, fonts: &Fonts, on: bool) {
+        if self.last_on == Some(on) {
+            return;
+        }
+        // Erase previous text (the pill background itself is redrawn below).
+        if let Some(last) = self.last_text_bbox {
+            fill_rect(fb, last.x1 as i32, last.y1 as i32, last.width() as i32, last.height() as i32, PANEL);
+        }
+        // Redraw the pill outline so old dots/text are fully covered.
+        fill_rounded_rect(fb, self.x, self.y, self.w, self.h, self.r, PANEL);
+        draw_rounded_rect_outline(fb, self.x, self.y, self.w, self.h, self.r, ACCENT);
+
+        let color = if on { OK } else { ALARM };
+        fill_ellipse(fb, self.dot_x, self.dot_y, self.dot_r, self.dot_r, color);
+
+        let mut style = self.text_style;
+        style.color = color;
+        let text = "TS";
+        fonts.draw(fb, text, self.text_x, self.text_baseline_y, &style);
+
+        // Compute text bbox for next erase.
+        let tw = fonts.measure(text, &style) as i32;
+        let g = fonts.glyph_ref('T', &style);
+        let gx = self.text_x + g.xmin;
+        let gy = self.text_baseline_y - g.ymin - g.height as i32 + 1;
+        self.last_text_bbox = Some(Rect::new(
+            gx.max(0) as usize,
+            gy.max(0) as usize,
+            (gx + tw).max(0) as usize,
+            (gy + 11).max(0) as usize,
+        ));
+
+        self.last_on = Some(on);
+    }
+}
+
+fn draw_rounded_rect_outline(fb: &mut Framebuffer, x: i32, y: i32, w: i32, h: i32, r: i32, color: u32) {
+    // Four edges, leaving the corner arcs untouched. Good enough for a 1px outline.
+    draw_line_h(fb, x + r, x + w - r, y, color);
+    draw_line_h(fb, x + r, x + w - r, y + h - 1, color);
+    fill_rect(fb, x, y + r, 1, h - 2 * r, color);
+    fill_rect(fb, x + w - 1, y + r, 1, h - 2 * r, color);
+}
+
+// ---------------------------------------------------------------------------
+// Hero metric card: rounded panel with label and value.
+// ---------------------------------------------------------------------------
+struct HeroCard {
+    label: Label,
+    value: Label,
+}
+
+impl HeroCard {
+    fn new(x: i32, y: i32, _label_text: &str, fonts: &Fonts) -> Self {
+        let label_style = TextStyle::new(11, GRAY, false);
+        let value_style = TextStyle::new(16, WHITE, false);
+        Self {
+            label: Label::new(x + 10, y + 8, label_style, Align::Left, PANEL, fonts),
+            value: Label::new(x + 10, y + 23, value_style, Align::Left, PANEL, fonts),
+        }
+    }
+
+    fn draw_card_background(&mut self, fb: &mut Framebuffer, x: i32, y: i32) {
+        fill_rounded_rect(fb, x, y, HERO_CARD_W, HERO_CARD_H, 4, PANEL);
+    }
+
+    fn draw_label(&mut self, fb: &mut Framebuffer, fonts: &Fonts, text: &str) {
+        self.label.force_draw(fb, fonts, text);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Rounded percentage bar (pill shape).
+// ---------------------------------------------------------------------------
+#[derive(Debug)]
+struct RoundedBar {
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    r: i32,
+    track_color: u32,
+    last_pct: i32,
+    last_fill_color: Option<u32>,
+}
+
+impl RoundedBar {
+    fn new(x: i32, y: i32, w: i32, h: i32, r: i32, track_color: u32) -> Self {
+        Self {
+            x,
+            y,
+            w,
+            h,
+            r,
+            track_color,
+            last_pct: -1,
+            last_fill_color: None,
+        }
+    }
+
+    fn fill_width(&self, pct: i32) -> i32 {
+        ((self.w as f32 * pct as f32) / 100.0) as i32
+    }
+
+    fn set(&mut self, fb: &mut Framebuffer, pct: f32, fill_color: u32) {
+        let pct_i = pct.round() as i32;
+        let color_changed = self.last_fill_color != Some(fill_color);
+        if pct_i == self.last_pct && !color_changed {
+            return;
+        }
+        // Full redraw: track + fill.
+        fill_rounded_rect(fb, self.x, self.y, self.w, self.h, self.r, self.track_color);
+        let fw = self.fill_width(pct_i);
+        if fw > 0 {
+            fill_rounded_rect(fb, self.x, self.y, fw, self.h, self.r, fill_color);
+        }
+        self.last_pct = pct_i;
+        self.last_fill_color = Some(fill_color);
+    }
+
+    fn force_draw(&mut self, fb: &mut Framebuffer, pct: f32, fill_color: u32) {
+        self.last_pct = -1;
+        self.last_fill_color = None;
+        self.set(fb, pct, fill_color);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CPU pill: label + rounded bar + right-aligned percentage.
+// ---------------------------------------------------------------------------
+struct CpuPill {
+    label: Label,
+    bar: RoundedBar,
+    pct: Label,
+}
+
+impl std::fmt::Debug for CpuPill {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CpuPill").finish()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Docker table row.
+// ---------------------------------------------------------------------------
+struct ContainerRow {
+    y: i32,
+    bg: u32,
+    dot_color: Option<u32>,
+    name: Label,
+    uptime: Label,
+    state: Label,
+    cpu: Label,
+}
+
+// ---------------------------------------------------------------------------
+// Monitor page.
+// ---------------------------------------------------------------------------
 pub struct MonitorPage {
     fonts: Fonts,
-    container_scroll_offset: usize,
     bg_done: bool,
     last_slow_render: f32,
     start: Instant,
+    container_scroll_offset: usize,
 
-    // Top panel
+    // Top bar
     host_label: Label,
     time_label: Label,
-    ts_label: Label,
+    ts_chip: TsChip,
 
-    // IP row
-    ip_label: Label,
+    // Hero cards
+    temp_card: HeroCard,
+    mem_card: HeroCard,
+    disk_card: HeroCard,
 
-    // CPU bars
-    cpu_labels: [Label; 4],
-    cpu_bars: [Bar; 4],
-    cpu_pct_labels: [Label; 4],
+    // CPU pills
+    cpu_pills: [CpuPill; 4],
 
-    // Metric values
-    temp_label: Label,
-    mem_label: Label,
-    disk_label: Label,
-
-    // Temperature trend
-    temp_trend_history: VecDeque<(f32, f32)>,
-    temp_trend_last_state: TrendState,
-    temp_trend_last_alarm: bool,
-    temp_trend_last_bbox: Option<Rect>,
-
-    // Container list
-    container_header_name: Label,
-    container_header_status: Label,
-    container_header_state: Label,
-    container_rows: Vec<ContainerRow>,
+    // Docker table
+    header_name: Label,
+    header_uptime: Label,
+    header_state: Label,
+    header_cpu: Label,
     page_label: Label,
+    container_rows: Vec<ContainerRow>,
+
     scroll_last_offset: usize,
     scroll_last_total: usize,
 
@@ -90,98 +319,109 @@ pub struct MonitorPage {
     footer_label: Label,
     fps_label: Label,
 
-    // Cached metric label x positions
-    metric_value_x: [i32; 3],
+    // Temperature trend
+    temp_trend_history: VecDeque<(f32, f32)>,
+    temp_trend_last_state: TrendState,
+    temp_trend_last_alarm: bool,
+    temp_trend_last_bbox: Option<Rect>,
 }
 
 impl MonitorPage {
     pub fn new(fonts: Fonts) -> Self {
         let host_style = TextStyle::new(16, CYAN, false);
-        let title_style = TextStyle::new(16, WHITE, false);
-        let small_style = TextStyle::new(11, GRAY, false);
-        let text_style = TextStyle::new(13, WHITE, false);
-        // Docker list uses Regular at 11 px: size 10 makes strokes like 'm'
-        // collapse into a blob on the 480×320 panel regardless of weight.
-        let tiny_style = TextStyle::new(11, WHITE, false).with_weight(FontWeight::Regular);
+        let time_style = TextStyle::new(16, WHITE, false);
 
-        let host_label = Label::new(8, 6, host_style, Align::Left, PANEL, &fonts);
-        // Time x will be recomputed on first render.
-        let time_label = Label::new(0, 6, title_style, Align::Left, PANEL, &fonts);
-        let ts_label = Label::new(295, 8, small_style, Align::Left, PANEL, &fonts);
+        let host_label = Label::new(12, 8, host_style, Align::Left, PANEL, &fonts);
+        let time_label = Label::new(TIME_RIGHT, 8, time_style, Align::Right, PANEL, &fonts);
+        let ts_chip = TsChip::new(
+            TS_CHIP_RIGHT - TS_CHIP_W,
+            TS_CHIP_Y,
+            TS_CHIP_W,
+            TS_CHIP_H,
+            TS_CHIP_R,
+            &fonts,
+        );
 
-        let ip_label = Label::new(8, 34, TextStyle::new(13, CYAN, false), Align::Left, BG, &fonts);
+        let temp_card = HeroCard::new(HERO_CARD_X[0], HERO_CARD_Y, "TEMP", &fonts);
+        let mem_card = HeroCard::new(HERO_CARD_X[1], HERO_CARD_Y, "MEM", &fonts);
+        let disk_card = HeroCard::new(HERO_CARD_X[2], HERO_CARD_Y, "DISK", &fonts);
 
-        let core_positions = [(8, 51), (248, 51), (8, 68), (248, 68)];
-        let cpu_labels = core_positions.map(|(x, y)| {
-            Label::new(x, y, TextStyle::new(13, GRAY, false), Align::Left, BG, &fonts)
-        });
-        let cpu_bars = core_positions.map(|(x, y)| {
-            Bar::new(x + 44, y + 3, 130, 9, ACCENT)
-        });
-        let cpu_pct_labels = core_positions.map(|(x, y)| {
-            Label::new(x + 44 + 130 + 6, y, TextStyle::new(13, WHITE, false), Align::Left, BG, &fonts)
-        });
+        let cpu_label_style = TextStyle::new(11, GRAY, false).with_weight(FontWeight::Regular);
+        let cpu_pct_style = TextStyle::new(11, WHITE, false).with_weight(FontWeight::Regular);
+        let mut cpu_pills = Vec::with_capacity(4);
+        for (_row_idx, row) in CPU_ROWS.iter().enumerate() {
+            for (col_idx, col) in CPU_COLS.iter().enumerate() {
+                let right = CPU_CELL_RIGHT[col_idx];
+                cpu_pills.push(CpuPill {
+                    label: Label::new(*col, *row, cpu_label_style, Align::Left, BG, &fonts),
+                    bar: RoundedBar::new(
+                        col + CPU_BAR_X_OFF,
+                        row + CPU_BAR_Y_OFF,
+                        CPU_BAR_W,
+                        CPU_BAR_H,
+                        CPU_BAR_R,
+                        ACCENT,
+                    ),
+                    pct: Label::new(right, *row, cpu_pct_style, Align::Right, BG, &fonts),
+                });
+            }
+        }
 
-        // Static metric labels. Their values never change; use a dummy label and
-        // draw them once in the static background instead.
-        let temp_label = Label::new(0, 85, text_style, Align::Left, BG, &fonts);
-        let mem_label = Label::new(0, 85, text_style, Align::Left, BG, &fonts);
-        let disk_label = Label::new(0, 85, text_style, Align::Left, BG, &fonts);
-
-        let header_style = TextStyle::new(11, GRAY, false);
-        let container_header_name = Label::new(20, DOCKER_HEADER_Y, header_style, Align::Left, BG, &fonts);
-        let container_header_status = Label::new(175, DOCKER_HEADER_Y, header_style, Align::Left, BG, &fonts);
-        let container_header_state = Label::new(360, DOCKER_HEADER_Y, header_style, Align::Left, BG, &fonts);
+        let header_style = TextStyle::new(11, GRAY, false).with_weight(FontWeight::Regular);
+        let header_name = Label::new(NAME_X, DOCKER_HEADER_Y, header_style, Align::Left, BG, &fonts);
+        let header_uptime = Label::new(UPTIME_RIGHT, DOCKER_HEADER_Y, header_style, Align::Right, BG, &fonts);
+        let header_state = Label::new(STATE_RIGHT, DOCKER_HEADER_Y, header_style, Align::Right, BG, &fonts);
+        let header_cpu = Label::new(CPU_RIGHT, DOCKER_HEADER_Y, header_style, Align::Right, BG, &fonts);
 
         let mut container_rows = Vec::with_capacity(CONTAINER_PAGE_SIZE);
         for i in 0..CONTAINER_PAGE_SIZE {
             let y = DOCKER_LIST_Y + i as i32 * DOCKER_LINE_HEIGHT;
             let bg = if i % 2 == 1 { ROW_STRIPE } else { BG };
+            let row_style = TextStyle::new(11, WHITE, false).with_weight(FontWeight::Regular);
+            let gray_style = TextStyle::new(11, GRAY, false).with_weight(FontWeight::Regular);
             container_rows.push(ContainerRow {
-                name: Label::new(20, y, tiny_style, Align::Left, bg, &fonts),
-                status: Label::new(175, y, TextStyle::new(11, GRAY, false).with_weight(FontWeight::Regular), Align::Left, bg, &fonts),
-                state: Label::new(360, y, tiny_style, Align::Left, bg, &fonts),
+                y,
                 bg,
-                dot_x: 350,
-                dot_y: y + 8,
                 dot_color: None,
+                name: Label::new(NAME_X, y, row_style, Align::Left, bg, &fonts),
+                uptime: Label::new(UPTIME_RIGHT, y, gray_style, Align::Right, bg, &fonts),
+                state: Label::new(STATE_RIGHT, y, row_style, Align::Right, bg, &fonts),
+                cpu: Label::new(CPU_RIGHT, y, row_style, Align::Right, bg, &fonts),
             });
         }
 
-        let page_label = Label::new(420, DOCKER_LIST_Y, TextStyle::new(11, GRAY, false), Align::Left, BG, &fonts);
-        let footer_label = Label::new(8, config::H as i32 - 18, TextStyle::new(11, GRAY, false).with_weight(FontWeight::Regular), Align::Left, PANEL, &fonts);
-        let fps_label = Label::new(340, config::H as i32 - 18, TextStyle::new(11, GRAY, false).with_weight(FontWeight::Regular), Align::Left, PANEL, &fonts);
+        let page_label = Label::new(PAGE_RIGHT, DOCKER_HEADER_Y, header_style, Align::Right, BG, &fonts);
+        let footer_style = TextStyle::new(11, GRAY, false).with_weight(FontWeight::Regular);
+        let footer_label = Label::new(12, config::H as i32 - 18, footer_style, Align::Left, PANEL, &fonts);
+        let fps_label = Label::new(TIME_RIGHT, config::H as i32 - 18, footer_style, Align::Right, PANEL, &fonts);
 
         Self {
             fonts,
-            container_scroll_offset: 0,
             bg_done: false,
             last_slow_render: -1000.0,
             start: Instant::now(),
+            container_scroll_offset: 0,
             host_label,
             time_label,
-            ts_label,
-            ip_label,
-            cpu_labels,
-            cpu_bars,
-            cpu_pct_labels,
-            temp_label,
-            mem_label,
-            disk_label,
-            temp_trend_history: VecDeque::new(),
-            temp_trend_last_state: TrendState::None,
-            temp_trend_last_alarm: false,
-            temp_trend_last_bbox: None,
-            container_header_name,
-            container_header_status,
-            container_header_state,
-            container_rows,
+            ts_chip,
+            temp_card,
+            mem_card,
+            disk_card,
+            cpu_pills: cpu_pills.try_into().unwrap(),
+            header_name,
+            header_uptime,
+            header_state,
+            header_cpu,
             page_label,
+            container_rows,
             scroll_last_offset: usize::MAX,
             scroll_last_total: usize::MAX,
             footer_label,
             fps_label,
-            metric_value_x: [0; 3],
+            temp_trend_history: VecDeque::new(),
+            temp_trend_last_state: TrendState::None,
+            temp_trend_last_alarm: false,
+            temp_trend_last_bbox: None,
         }
     }
 
@@ -189,115 +429,122 @@ impl MonitorPage {
         self.start.elapsed().as_secs_f32()
     }
 
+    // -----------------------------------------------------------------------
+    // Static background.
+    // -----------------------------------------------------------------------
     fn draw_static_background(&mut self, fb: &mut Framebuffer) {
-        // Clear screen.
         fill_rect(fb, 0, 0, W as i32, config::H as i32, BG);
 
         // Top panel.
-        fill_rect(fb, 0, 0, W as i32, 30, PANEL);
+        fill_rect(fb, 0, 0, W as i32, TOP_PANEL_H, PANEL);
 
-        // CPU bars: static labels and tracks.
-        for (idx, (_x, _y)) in [(8, 51), (248, 51), (8, 68), (248, 68)].iter().enumerate() {
-            self.cpu_labels[idx].force_draw(fb, &self.fonts, &format!("CPU{idx}"));
-            self.cpu_bars[idx].force_draw(fb, 0.0, config::GREEN);
+        // Hero cards.
+        for x in HERO_CARD_X {
+            self.temp_card.draw_card_background(fb, x, HERO_CARD_Y);
         }
-        // Static metric labels.
-        for (label, x, text) in [
-            ("TEMP", 8, "TEMP "),
-            ("MEM", 126, "MEM "),
-            ("DISK", 360, "DISK "),
-        ] {
-            let style = TextStyle::new(13, GRAY, false);
-            let w = self.fonts.measure(text, &style) as i32;
-            self.fonts.draw(fb, text, x, self.fonts.baseline_y(85, &style), &style);
-            let idx = match label {
-                "TEMP" => 0,
-                "MEM" => 1,
-                _ => 2,
-            };
-            self.metric_value_x[idx] = x + w;
-        }
-        // Horizontal separator.
-        draw_line_h(fb, 0, W as i32, 100, ACCENT);
+        self.temp_card.draw_label(fb, &self.fonts, "TEMP");
+        self.mem_card.draw_label(fb, &self.fonts, "MEM");
+        self.disk_card.draw_label(fb, &self.fonts, "DISK");
 
-        // Container list zebra stripes (static background).
+        // CPU labels and empty bars.
+        for (idx, pill) in self.cpu_pills.iter_mut().enumerate() {
+            pill.label.force_draw(fb, &self.fonts, &format!("CPU{idx}"));
+            pill.bar.force_draw(fb, 0.0, OK);
+        }
+
+        // Docker header.
+        self.header_name.force_draw(fb, &self.fonts, "NAME");
+        self.header_uptime.force_draw(fb, &self.fonts, "UPTIME");
+        self.header_state.force_draw(fb, &self.fonts, "STATE");
+        self.header_cpu.force_draw(fb, &self.fonts, "CPU");
+        draw_line_h(fb, 12, DOCKER_RIGHT, UNDERLINE_Y, ACCENT);
+
+        // Zebra stripes.
         for i in 0..CONTAINER_PAGE_SIZE as i32 {
             let y = DOCKER_LIST_Y + i * DOCKER_LINE_HEIGHT;
             if i % 2 == 1 {
-                fill_rect(fb, 4, y, 470 - 4, DOCKER_LINE_HEIGHT, ROW_STRIPE);
+                fill_rect(fb, 12, y, DOCKER_ZEBRA_RIGHT - 12, DOCKER_LINE_HEIGHT, ROW_STRIPE);
             }
         }
-        // Container header underline.
-        draw_line_h(fb, 4, 470, DOCKER_LIST_Y - 3, ACCENT);
 
-        // Container header.
-        self.container_header_name.force_draw(fb, &self.fonts, "CONTAINER");
-        self.container_header_status.force_draw(fb, &self.fonts, "STATUS");
-        self.container_header_state.force_draw(fb, &self.fonts, "STATE");
-        // Bottom status bar.
+        // Bottom bar.
         fill_rect(fb, 0, config::H as i32 - 20, W as i32, 20, PANEL);
         self.footer_label.force_draw(fb, &self.fonts, "Powered by RichLi4307");
         self.fps_label.force_draw(fb, &self.fonts, "15 FPS");
     }
 
+    // -----------------------------------------------------------------------
+    // Slow content (1 Hz).
+    // -----------------------------------------------------------------------
     fn draw_slow_content(&mut self, fb: &mut Framebuffer, snapshot: &MetricsSnapshot) {
-        // Host name.
         self.host_label.set(fb, &self.fonts, "FocusRasPi4B");
-        // Time: recompute x based on host width.
-        let host_w = self.fonts.measure("FocusRasPi4B", &TextStyle::new(16, CYAN, false)) as i32;
-        self.time_label.set_x(8 + host_w + 10);
+
         let now_str = {
             let dt = OffsetDateTime::now_local().unwrap_or_else(|_| OffsetDateTime::now_utc());
             format!("{:02}:{:02}:{:02}", dt.hour(), dt.minute(), dt.second())
         };
         self.time_label.set(fb, &self.fonts, &now_str);
 
-        // Tailscale status.
-        let ts_color = if snapshot.tailscale == "ON" { GREEN } else { RED };
-        self.ts_label.set_style_color(ts_color);
-        self.ts_label.set(fb, &self.fonts, &format!("TS:{}", snapshot.tailscale));
+        let ts_on = snapshot.tailscale == "ON";
+        self.ts_chip.draw(fb, &self.fonts, ts_on);
 
-        // IP row.
-        let ip_str = snapshot.ips.iter().take(3).cloned().collect::<Vec<_>>().join("             ");
-        self.ip_label.set(fb, &self.fonts, &format!("IP {ip_str}"));
-
-        // Metric values.
+        // Hero values.
         let temp_val = parse_temp(&snapshot.temp).unwrap_or(50);
         let temp_color = temp_band_color(temp_val);
-        self.temp_label.set_x(self.metric_value_x[0]);
-        self.temp_label.set_style_color(temp_color);
-        self.temp_label.set(fb, &self.fonts, &snapshot.temp);
+        self.temp_card.value.set_style_color(temp_color);
+        self.temp_card.value.set(fb, &self.fonts, &snapshot.temp);
 
-        // Temperature trend arrow + alarm mark.
+        let mem_pct = parse_percent(&snapshot.mem).unwrap_or(0);
+        self.mem_card.value.set_style_color(usage_text_color(mem_pct));
+        self.mem_card.value.set(fb, &self.fonts, &format!("{mem_pct}%"));
+
+        let disk_pct = parse_percent(&snapshot.disk).unwrap_or(0);
+        self.disk_card.value.set_style_color(usage_text_color(disk_pct));
+        self.disk_card.value.set(fb, &self.fonts, &format!("{disk_pct}%"));
+
+        // Temperature trend arrow.
         let now = self.now_secs();
         self.update_temp_trend(now, temp_val as f32);
         let (trend_state, trend_alarm) = self.evaluate_temp_trend(now);
-        let temp_style = TextStyle::new(13, temp_color, false);
-        let trend_x = self.metric_value_x[0]
-            + self.fonts.measure(&snapshot.temp, &temp_style) as i32
-            + 4;
+        let value_style = TextStyle::new(16, temp_color, false);
+        let value_w = self.fonts.measure(&snapshot.temp, &value_style) as i32;
+        let trend_x = HERO_CARD_X[0] + 10 + value_w + 4;
+        let trend_y = self.temp_card.value.baseline_y();
         let fonts = self.fonts.clone();
         self.draw_temp_trend(
             fb,
             &fonts,
             trend_x,
-            self.temp_label.baseline_y(),
-            temp_color,
+            trend_y,
             trend_state,
             trend_alarm,
         );
+    }
 
-        self.mem_label.set_x(self.metric_value_x[1]);
-        let mem_pct = parse_percent(&snapshot.mem).unwrap_or(0);
-        self.mem_label.set_style_color(usage_text_color(mem_pct));
-        self.mem_label.set(fb, &self.fonts, &snapshot.mem);
+    // -----------------------------------------------------------------------
+    // CPU pills (fast path).
+    // -----------------------------------------------------------------------
+    fn draw_cpu_pills(&mut self, fb: &mut Framebuffer, cpu: &[(String, f32)]) {
+        for idx in 0..4 {
+            let pct = cpu
+                .iter()
+                .find(|(name, _)| name == &format!("cpu{idx}"))
+                .map(|(_, v)| *v)
+                .unwrap_or(0.0);
+            let fill_color = USAGE_COLOR_LUT[pct as usize];
+            self.cpu_pills[idx].bar.set(fb, pct, fill_color);
+            let pct_text = format!("{:.0}%", pct);
+            let pct_i = pct.round() as i32;
+            self.cpu_pills[idx].pct.set_style_color(usage_text_color(pct_i));
+            self.cpu_pills[idx].pct.set(fb, &self.fonts, &pct_text);
+        }
+    }
 
-        self.disk_label.set_x(self.metric_value_x[2]);
-        let disk_pct = parse_percent(&snapshot.disk).unwrap_or(0);
-        self.disk_label.set_style_color(usage_text_color(disk_pct));
-        self.disk_label.set(fb, &self.fonts, &snapshot.disk);
-
-        // Container list.
+    // -----------------------------------------------------------------------
+    // Docker table (slow path, called from draw_slow_content ideally; here kept
+    // separate for clarity).
+    // -----------------------------------------------------------------------
+    fn draw_docker_table(&mut self, fb: &mut Framebuffer, snapshot: &MetricsSnapshot) {
         let total = snapshot.containers.len();
         let max_offset = total.saturating_sub(CONTAINER_PAGE_SIZE);
         if self.container_scroll_offset > max_offset {
@@ -312,28 +559,38 @@ impl MonitorPage {
             .collect();
 
         for (i, row) in self.container_rows.iter_mut().enumerate() {
-            if let Some((name, status, state)) = visible.get(i).map(|c| (&c.0, &c.1, &c.2)) {
-                let status_unhealthy = status.contains("(unhealthy)");
-                let state_color = Self::container_state_color(state, status_unhealthy);
-                let tiny_style = TextStyle::new(11, WHITE, false).with_weight(FontWeight::Regular);
-                let status_style = TextStyle::new(11, GRAY, false).with_weight(FontWeight::Regular);
+            if let Some(c) = visible.get(i) {
+                let status_unhealthy = c.status.contains("(unhealthy)");
+                let state_color = Self::container_state_color(&c.state, status_unhealthy);
+                let name_style = TextStyle::new(11, WHITE, false).with_weight(FontWeight::Regular);
 
-                let display_name = Self::truncate_to_width(name, 151.0, &self.fonts, &tiny_style);
+                let display_name = Self::truncate_to_width(&c.name, (PAGE_RIGHT - NAME_X - 4) as f32, &self.fonts, &name_style);
                 row.name.set(fb, &self.fonts, &display_name);
 
-                let abbr_status = abbreviate_status(status);
-                let display_status = Self::truncate_to_width(&abbr_status, 181.0, &self.fonts, &status_style);
-                row.status.set(fb, &self.fonts, &display_status);
+                let abbr = abbreviate_status(&c.status);
+                row.uptime.set(fb, &self.fonts, &abbr);
 
-                let display_state = Self::truncate_to_width(state, 112.0, &self.fonts, &tiny_style);
                 row.state.set_style_color(state_color);
-                row.state.set(fb, &self.fonts, &display_state);
+                row.state.set(fb, &self.fonts, &c.state);
+
+                let cpu_text = match c.cpu {
+                    Some(pct) => {
+                        row.cpu.set_style_color(usage_text_color(pct.round() as i32));
+                        format!("{:.1}%", pct)
+                    }
+                    None => {
+                        row.cpu.set_style_color(GRAY);
+                        "-".to_string()
+                    }
+                };
+                row.cpu.set(fb, &self.fonts, &cpu_text);
 
                 Self::draw_state_dot(fb, row, state_color);
             } else {
                 row.name.clear(fb);
-                row.status.clear(fb);
+                row.uptime.clear(fb);
                 row.state.clear(fb);
+                row.cpu.clear(fb);
                 Self::clear_state_dot(fb, row);
             }
         }
@@ -343,33 +600,15 @@ impl MonitorPage {
         let total_pages = ((total + CONTAINER_PAGE_SIZE - 1) / CONTAINER_PAGE_SIZE).max(1);
         let current_page = (offset / CONTAINER_PAGE_SIZE) + 1;
         if total_pages > 1 {
-            self.page_label
-                .set(fb, &self.fonts, &format!("{current_page}/{total_pages}"));
+            self.page_label.set(fb, &self.fonts, &format!("{current_page}/{total_pages}"));
         } else {
             self.page_label.clear(fb);
         }
     }
 
-    fn draw_cpu_bars(&mut self, fb: &mut Framebuffer, cpu: &[(String, f32)]) {
-        for idx in 0..4 {
-            let pct = cpu
-                .iter()
-                .find(|(name, _)| name == &format!("cpu{idx}"))
-                .map(|(_, v)| *v)
-                .unwrap_or(0.0);
-            let color = USAGE_COLOR_LUT[pct as usize];
-            self.cpu_bars[idx].set(fb, pct, color);
-            let pct_text = format!("{:.0}%", pct);
-            let pct_i = pct.round() as i32;
-            self.cpu_pct_labels[idx].set_style_color(usage_text_color(pct_i));
-            self.cpu_pct_labels[idx].set(fb, &self.fonts, &pct_text);
-        }
-    }
-
     // -----------------------------------------------------------------------
-    // Text truncation helpers
+    // Helpers.
     // -----------------------------------------------------------------------
-
     fn truncate_to_width(text: &str, max_width: f32, fonts: &Fonts, style: &TextStyle) -> String {
         if fonts.measure(text, style) <= max_width {
             return text.to_string();
@@ -387,10 +626,6 @@ impl MonitorPage {
         }
         "..".to_string()
     }
-
-    // -----------------------------------------------------------------------
-    // Container state dot
-    // -----------------------------------------------------------------------
 
     fn container_state_color(state: &str, status_unhealthy: bool) -> u32 {
         if status_unhealthy || state == "dead" {
@@ -411,29 +646,26 @@ impl MonitorPage {
             return;
         }
         if row.dot_color.is_some() {
-            fill_ellipse(fb, row.dot_x, row.dot_y, 3, 3, row.bg);
+            fill_ellipse(fb, DOT_X, row.y + 7, 3, 3, row.bg);
         }
-        fill_ellipse(fb, row.dot_x, row.dot_y, 3, 3, color);
+        fill_ellipse(fb, DOT_X, row.y + 7, 3, 3, color);
         row.dot_color = Some(color);
     }
 
     fn clear_state_dot(fb: &mut Framebuffer, row: &mut ContainerRow) {
         if row.dot_color.is_some() {
-            fill_ellipse(fb, row.dot_x, row.dot_y, 3, 3, row.bg);
+            fill_ellipse(fb, DOT_X, row.y + 7, 3, 3, row.bg);
             row.dot_color = None;
         }
     }
 
-    // -----------------------------------------------------------------------
-    // Scroll track (only when total pages > 1)
-    // -----------------------------------------------------------------------
-
     fn draw_scroll_track(&mut self, fb: &mut Framebuffer, offset: usize, total: usize) {
         let total_pages = ((total + CONTAINER_PAGE_SIZE - 1) / CONTAINER_PAGE_SIZE).max(1);
+        let track_top = DOCKER_LIST_Y;
+        let track_h = DOCKER_LINE_HEIGHT * CONTAINER_PAGE_SIZE as i32;
         if total_pages <= 1 {
-            // Erase a previously drawn track if the container count dropped.
             if self.scroll_last_total != usize::MAX {
-                fill_rect(fb, 472, 126, 4, 160, BG);
+                fill_rect(fb, DOCKER_TRACK_X, track_top, DOCKER_TRACK_W, track_h, BG);
                 self.scroll_last_offset = usize::MAX;
                 self.scroll_last_total = usize::MAX;
             }
@@ -443,26 +675,24 @@ impl MonitorPage {
             return;
         }
 
-        // Full redraw: erase, track, thumb.
-        fill_rect(fb, 472, 126, 4, 160, BG);
-        fill_rect(fb, 472, 126, 4, 160, SCROLL_TRACK);
+        fill_rect(fb, DOCKER_TRACK_X, track_top, DOCKER_TRACK_W, track_h, BG);
+        fill_rect(fb, DOCKER_TRACK_X, track_top, DOCKER_TRACK_W, track_h, SCROLL_TRACK);
         let max_offset = total.saturating_sub(CONTAINER_PAGE_SIZE);
-        let thumb_h = (160 * CONTAINER_PAGE_SIZE / total).max(8);
+        let thumb_h = (track_h as usize * CONTAINER_PAGE_SIZE / total).max(8);
         let thumb_y = if max_offset == 0 {
-            126
+            track_top
         } else {
-            126 + (160 - thumb_h) * offset / max_offset
+            track_top + (track_h - thumb_h as i32) * offset as i32 / max_offset as i32
         };
-        fill_rect(fb, 472, thumb_y as i32, 4, thumb_h as i32, GRAY);
+        fill_rect(fb, DOCKER_TRACK_X, thumb_y, DOCKER_TRACK_W, thumb_h as i32, GRAY);
 
         self.scroll_last_offset = offset;
         self.scroll_last_total = total;
     }
 
     // -----------------------------------------------------------------------
-    // Temperature trend arrow + alarm mark
+    // Temperature trend.
     // -----------------------------------------------------------------------
-
     fn update_temp_trend(&mut self, now: f32, temp: f32) {
         self.temp_trend_history.push_back((now, temp));
         while let Some(&(t, _)) = self.temp_trend_history.front() {
@@ -506,13 +736,12 @@ impl MonitorPage {
         fonts: &Fonts,
         x: i32,
         baseline_y: i32,
-        color: u32,
         state: TrendState,
         alarm: bool,
     ) {
         if state == TrendState::None {
             if let Some(last) = self.temp_trend_last_bbox {
-                fill_rect(fb, last.x1 as i32, last.y1 as i32, last.width() as i32, last.height() as i32, BG);
+                fill_rect(fb, last.x1 as i32, last.y1 as i32, last.width() as i32, last.height() as i32, PANEL);
                 self.temp_trend_last_bbox = None;
             }
             self.temp_trend_last_state = TrendState::None;
@@ -520,16 +749,23 @@ impl MonitorPage {
             return;
         }
 
+        let arrow_color = match state {
+            TrendState::Rising => TREND_HOT,
+            TrendState::Falling => COOL,
+            TrendState::Steady => GRAY,
+            TrendState::None => PANEL,
+        };
+
         let mut new_bbox = Rect::new(
             x.max(0) as usize,
-            (baseline_y - 2).max(0) as usize,
-            (x + 7).max(0) as usize,
-            (baseline_y + 3).max(0) as usize,
+            (baseline_y - TREND_H / 2).max(0) as usize,
+            (x + TREND_W).max(0) as usize,
+            (baseline_y + TREND_H / 2 + 1).max(0) as usize,
         );
         let alarm_bbox = if alarm {
-            let style = TextStyle::new(13, ALARM, false);
+            let style = TextStyle::new(16, ALARM, false);
             let g = fonts.glyph_ref('!', &style);
-            let ax = x + 7 + 4;
+            let ax = x + TREND_W + 4;
             let gx = ax + g.xmin;
             let gy = baseline_y - g.ymin - g.height as i32 + 1;
             Some(Rect::new(
@@ -553,44 +789,22 @@ impl MonitorPage {
         }
 
         if let Some(last) = self.temp_trend_last_bbox {
-            fill_rect(fb, last.x1 as i32, last.y1 as i32, last.width() as i32, last.height() as i32, BG);
+            fill_rect(fb, last.x1 as i32, last.y1 as i32, last.width() as i32, last.height() as i32, PANEL);
         }
 
         match state {
-            TrendState::Rising => Self::draw_up_arrow(fb, x, baseline_y, color),
-            TrendState::Falling => Self::draw_down_arrow(fb, x, baseline_y, color),
-            TrendState::Steady => Self::draw_steady_bar(fb, x, baseline_y, color),
+            TrendState::Rising => fill_triangle(fb, x + TREND_W / 2, baseline_y, TREND_W, TREND_H, true, arrow_color),
+            TrendState::Falling => fill_triangle(fb, x + TREND_W / 2, baseline_y, TREND_W, TREND_H, false, arrow_color),
+            TrendState::Steady => fill_rect(fb, x, baseline_y - 1, TREND_W, 2, arrow_color),
             TrendState::None => {}
         }
         if alarm {
-            fonts.draw(fb, "!", x + 7 + 4, baseline_y, &TextStyle::new(13, ALARM, false));
+            fonts.draw(fb, "!", x + TREND_W + 4, baseline_y, &TextStyle::new(16, ALARM, false));
         }
 
         self.temp_trend_last_state = state;
         self.temp_trend_last_alarm = alarm;
         self.temp_trend_last_bbox = Some(new_bbox);
-    }
-
-    fn draw_up_arrow(fb: &mut Framebuffer, x: i32, baseline_y: i32, color: u32) {
-        for row in 0..5 {
-            let y = baseline_y - 2 + row;
-            let w = if row <= 2 { 2 * row + 1 } else { 7 };
-            let start_x = x + (7 - w) / 2;
-            fill_rect(fb, start_x, y, w, 1, color);
-        }
-    }
-
-    fn draw_down_arrow(fb: &mut Framebuffer, x: i32, baseline_y: i32, color: u32) {
-        for row in 0..5 {
-            let y = baseline_y - 2 + row;
-            let w = if row >= 2 { 2 * (4 - row) + 1 } else { 7 };
-            let start_x = x + (7 - w) / 2;
-            fill_rect(fb, start_x, y, w, 1, color);
-        }
-    }
-
-    fn draw_steady_bar(fb: &mut Framebuffer, x: i32, baseline_y: i32, color: u32) {
-        fill_rect(fb, x, baseline_y - 1, 7, 2, color);
     }
 }
 
@@ -609,10 +823,11 @@ impl Page for MonitorPage {
         let now = self.now_secs();
         if now - self.last_slow_render >= SLOW_RENDER_INTERVAL {
             self.draw_slow_content(fb, snapshot);
+            self.draw_docker_table(fb, snapshot);
             self.last_slow_render = now;
         }
 
-        self.draw_cpu_bars(fb, &snapshot.cpu);
+        self.draw_cpu_pills(fb, &snapshot.cpu);
         Ok(())
     }
 
@@ -621,15 +836,9 @@ impl Page for MonitorPage {
             return PageAction::None;
         }
         let y = ev.y;
-
-        if y < DOCKER_START_Y || y > DOCKER_START_Y + (CONTAINER_PAGE_SIZE as i32) * DOCKER_LINE_HEIGHT + 20 {
+        if y < DOCKER_HEADER_Y || y >= DOCKER_LIST_Y + CONTAINER_PAGE_SIZE as i32 * DOCKER_LINE_HEIGHT {
             return PageAction::None;
         }
-
-        if y < DOCKER_LIST_Y {
-            return PageAction::None;
-        }
-
         self.container_scroll_offset += 1;
         PageAction::None
     }
@@ -675,7 +884,7 @@ mod tests {
     #[test]
     fn touch_release_ignored() {
         let mut page = make_page();
-        let ev = TouchEvent { x: 100, y: 150, pressed: false, timestamp: 0.0 };
+        let ev = TouchEvent { x: 100, y: 200, pressed: false, timestamp: 0.0 };
         assert_eq!(page.on_touch(ev), PageAction::None);
     }
 
@@ -712,8 +921,14 @@ mod tests {
             ips: vec!["192.168.1.250".into(), "100.118.236.1".into()],
             tailscale: "ON".into(),
             containers: vec![
-                ("astrbot".into(), "Up 15 hours".into(), "running".into()),
-                ("napcat".into(), "Up 15 hours".into(), "running".into()),
+                ContainerInfo { name: "astrbot".into(), status: "Up 15 hours".into(), state: "running".into(), cpu: Some(0.8) },
+                ContainerInfo { name: "napcat".into(), status: "Up 15 hours".into(), state: "running".into(), cpu: Some(0.1) },
+                ContainerInfo { name: "homeassistant".into(), status: "Up 3 hours".into(), state: "running".into(), cpu: Some(2.1) },
+                ContainerInfo { name: "pi-dashboard-mcp".into(), status: "Up 3 hours".into(), state: "running".into(), cpu: None },
+                ContainerInfo { name: "github-proxy".into(), status: "Up 30 hours".into(), state: "running".into(), cpu: Some(0.0) },
+                ContainerInfo { name: "hass-mcp".into(), status: "Up 30 hours".into(), state: "running".into(), cpu: Some(0.0) },
+                ContainerInfo { name: "mcp-python-sandbox".into(), status: "Up 18 hours".into(), state: "running".into(), cpu: Some(0.5) },
+                ContainerInfo { name: "exited-demo".into(), status: "Exited (0) 3 hours ago".into(), state: "exited".into(), cpu: Some(0.0) },
             ],
             disk: "11%".into(),
             temp: "63C".into(),
@@ -731,6 +946,5 @@ mod tests {
         assert!(!png.is_empty());
         let path = "/tmp/pi_dashboard_golden_rust.png";
         std::fs::write(path, png).expect("write png");
-        // For automated diff, a Python reference generator compares against this file.
     }
 }
