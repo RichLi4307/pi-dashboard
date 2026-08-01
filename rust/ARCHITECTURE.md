@@ -3,12 +3,13 @@
 > 本文档已经架构师评审修订，与 `../docs/rust-coder-brief.md` 共同作为施工依据。
 > 评审要点：新增 Page 抽象（未来触屏交互/多页面不可写死）、tokio 改单线程 runtime、
 > 移除 evdev/nix/mmap 依赖、IPC 与触摸逐字段对齐 Python 版。
+> 2026-08-01 更新：v4 下钻仪表盘（TEMP/CPU/MEM/DISK/NET 详情页 + 电源弹窗）。
 
 ## 1. 顶层目标
 
 - **单一二进制**：`pi-dashboard-rust`，systemd 直接拉起。
-- **页面可扩展**：当前只实现 monitor 页面，但页面注册、触摸路由、IPC 切页全部走 Page 抽象，加页面不改核心。
-- **低抖动主循环**：10 FPS 节拍，子进程全部异步 + 缓存 + 超时。
+- **页面可扩展**：已实现 monitor + 五个详情页；页面注册、触摸路由、IPC 切页全部走 Page 抽象，加页面不改核心。
+- **低抖动主循环**：15 FPS 节拍，子进程全部异步 + 缓存 + 超时；IO 采集走 /proc 文件解析。
 - **脏区驱动刷新**：仅把 dirty rectangle 合并后写入 `/dev/fb1`，无脏区零写入，降低 SPI 流量与功耗。
 
 ## 2. 模块结构
@@ -18,13 +19,20 @@ src/
 ├── main.rs        # 入口：tokio current_thread runtime、日志、组装各模块、主循环（无页面专属逻辑）
 ├── config.rs      # 常量：分辨率、颜色、渐变 LUT、刷新间隔、字体路径、socket 路径、TOUCH_DEVICES
 ├── fb.rs          # Framebuffer：RGB565 buffer + dirty rect 按重叠区域合并 + write_at 局部/全量写出
-├── render.rs      # 几何原语：矩形、线、椭圆；RGB565 混合；fill_rect 写前比较、无变化不标脏
+├── render.rs      # 几何原语：矩形、线、椭圆、圆角矩形、三角形；RGB565 混合；fill_rect 写前比较
 ├── text.rs        # 文本引擎：Fonts glyph 缓存（启动预热）、TextStyle、字体级 baseline 锚定的 draw/measure
 ├── label.rs       # Label/Bar 字段控件：值变化才擦除重绘，脏区 = 旧bbox∪新bbox（页面由字段组合而成）
-├── metrics.rs     # 快通道 /proc//sys 采集 + 慢通道（docker/tailscale/IP）异步缓存，watch 发布
+├── chart.rs       # LineChart 折线图控件：固定/自动量程、网格、阈值线、脏区=图表矩形
+├── metrics.rs     # 快通道 /proc//sys 采集 + 慢通道（docker/tailscale/IP）异步缓存 + History 环形缓冲
 ├── pages/
-│   ├── mod.rs     # Page trait、PageAction、PageManager、页面注册表
-│   └── monitor.rs # MonitorPage：复刻现有 monitor 布局与容器滚动
+│   ├── mod.rs     # Page trait、PageAction、PageManager、页面注册表、60s 自动返回
+│   ├── detail_common.rs  # 详情页共享模板：返回键、标题、大值、信息区
+│   ├── monitor.rs # MonitorPage：v4 主页（四卡/顶栏按钮/CPU/Docker/电源弹窗）
+│   ├── temp.rs    # TempPage：温度折线 + 传感器/Throttled/Trend
+│   ├── cpu.rs     # CpuPage：总占用折线 + 负载/频率/ governor
+│   ├── mem.rs     # MemPage：内存折线 + meminfo 详情
+│   ├── disk.rs    # DiskPage：IO 折线 + 空间/挂载信息
+│   └── net.rs     # NetPage：速率折线 + 接口/IP/Tailscale
 ├── touch.rs       # 裸解析 input_event（复刻 touch.py），pointercal 支持，AsyncFd 非阻塞
 ├── ipc.rs         # Unix socket server，逐行 JSON oneshot 协议
 └── screenshot.rs  # RGB565 → RGB888 → PNG → base64
@@ -33,9 +41,15 @@ src/
 ## 3. 数据流
 
 ```text
-/proc /sys ──▶ metrics 快通道 ─┐
-docker ps ───▶ metrics 慢通道 ─┼─▶ watch::Sender<MetricsSnapshot> ─┬─▶ 主循环（borrow 只读）
-tailscale ───▶ (tokio 任务)   ─┘                                  └─▶ ipc.rs（status 用缓存）
+/proc/net/dev ──┐
+/proc/diskstats─┼──▶ metrics IO 快通道 (1 Hz) ──┐
+/proc/stat ─────┘                                │
+/proc/meminfo ───────────────────────────────────┤
+/sys/thermal ────────────────────────────────────┼──▶ History 环形缓冲 ──┐
+                                                 │                       │
+docker ps ────▶ metrics 慢通道 (5 s) ───┐        │                       │
+tailscale ────▶ (tokio 任务)           ├─▶ watch::Sender<MetricsSnapshot>├─▶ 主循环（borrow 只读）
+hostname -I ──▶                        ─┘                                └─▶ ipc.rs（status 用缓存）
 
 touch fd ──▶ touch.rs ──mpsc──▶ 主循环 ──▶ PageManager.route_touch ──▶ 活跃 Page
                                          ──▶ Page.render(fb, snapshot) 标脏
@@ -72,17 +86,22 @@ pub trait Page {
     fn on_touch(&mut self, ev: TouchEvent) -> PageAction;
     /// 切页进入时调用：触发全屏重绘（默认实现即可）
     fn on_enter(&mut self, fb: &mut Framebuffer) { fb.mark_full_dirty(); }
+    /// 切页离开时调用：默认空实现，未来页面可释放资源
+    fn on_leave(&mut self, fb: &mut Framebuffer) { let _ = fb; }
 }
 
 pub struct PageManager {
     pages: HashMap<&'static str, Box<dyn Page>>,
     active: &'static str,
+    home_id: &'static str,
+    last_activity: Instant,
 }
 ```
 
-- 新页面 = 新文件实现 `Page` + 在 `pages/mod.rs` 的注册函数加一行。主循环、IPC、touch 均不感知具体页面。
-- IPC `switch_mode` 的 `mode` 即页面 id；未知 id 回 error（协议兼容要求该 action 必须保留）。
-- 触摸热区（容器列表滚动区、未来切页按钮）由各 Page 内部处理；不引入通用 widget 框架。
+- 新页面 = 新文件实现 `Page` + 在 `main.rs` 注册一行。主循环、IPC、touch 均不感知具体页面。
+- IPC `switch_mode` 的 `mode` 即页面 id；当前合法集合 `{monitor,temp,cpu,mem,disk,net}`，未知 id 回 error（协议兼容要求该 action 必须保留）。
+- 触摸热区（容器列表滚动区、详情页返回键、主页四卡/CPU 区/电源按钮）由各 Page 内部处理；不引入通用 widget 框架。
+- 详情页 60s 无触摸自动返回 monitor（`PageManager.check_idle_timeout`）。
 
 ### 4.3 指标采集与共享
 
@@ -91,8 +110,13 @@ pub struct PageManager {
   - 温度：`/sys/class/thermal/thermal_zone0/temp`。
   - 内存/磁盘：`/proc/meminfo`、statvfs（间隔同 Python 版）。
   - 时间：`time` crate 本地时区。
-- **慢通道**（独立 tokio 任务，间隔与 config.py 一致）：
+- **IO 快通道**（metrics 后台任务 1 Hz，禁止子进程）：
+  - 网络：`/proc/net/dev` 聚合非 lo/docker/veth/br-* 接口。
+  - 磁盘：`/proc/diskstats` 取 `mmcblk0` 第 6/10 字段 × 512B。
+  - 差分计算实际速率，写入 `History` 环形缓冲（8 序列 × 120 点）。
+- **慢通道**（独立 tokio 任务，间隔 5s）：
   - IP（`hostname -I`）、Tailscale（`tailscale status --json`）、Docker（`docker ps -a`），全部 `tokio::process` + `timeout`（docker 3s、tailscale 5s），失败保留旧缓存记 warn。
+  - 容器 CPU 改为读 cgroup v2 `cpu.stat`（`usage_usec`），避免 `docker stats` 高负载。
 - 共享：`tokio::sync::watch::channel<MetricsSnapshot>`，主循环与 IPC 都只读 `borrow()`，无锁竞争。
 
 ### 4.4 主循环与运行时
@@ -104,9 +128,10 @@ loop {
     ticker.tick().await;
     // 1. 排空 touch mpsc → PageManager.route_touch（产生 PageAction 则切页）
     // 2. 排空 IPC 控制 mpsc（switch_mode / scroll_containers）
-    // 3. 读快通道指标，合并慢通道 snapshot
-    // 4. active page render → 标脏；任何 Err：log + 跳过本帧
-    // 5. fb.flush_dirty()（无脏零写入）
+    // 3. 检查详情页 60s  idle 超时
+    // 4. 读快通道指标，合并慢通道 snapshot
+    // 5. active page render → 标脏；任何 Err：log + 跳过本帧
+    // 6. fb.flush_dirty()（无脏零写入）
 }
 ```
 
@@ -121,6 +146,10 @@ loop {
 - `/etc/pointercal` 存在则按同一矩阵公式映射，否则原样传递并钳制 479×319。
 - 语义：按下期间坐标变化实时上报 pressed 事件；抬起以最后坐标上报一次 release。
 - 设备缺失：任务内退避重试，不影响其余功能。
+- v4 触摸热区：
+  - 主页：四卡 → 详情页，CPU 区 → cpu 页，[RST]/[PWR] → 确认弹窗，Docker 表 → 滚动，[MENU] 占位 no-op。
+  - 详情页：左上角返回键 → monitor，其余区域仅重置 60s 计时。
+  - 弹窗：CANCEL / 点外取消，CONFIRM 执行，10s 无操作自动取消。
 
 ### 4.6 IPC 协议（逐字段对齐 ipc_server.py）
 
@@ -129,7 +158,7 @@ loop {
 - 响应格式：
   - `screenshot` → `{"status":"ok","data":"<base64 png>"}`
   - `status` → `{"status":"ok","ips":[...],"tailscale":"..."}`（数据取自慢通道缓存，不实时跑子进程）
-  - `switch_mode`（`mode` 字段）→ PageManager 切页；未知 mode → `{"status":"error","message":"unknown mode: ..."}`
+  - `switch_mode`（`mode` 字段）→ PageManager 切页；合法 mode 集合 `{monitor,temp,cpu,mem,disk,net}`，未知 mode → `{"status":"error","message":"unknown mode: ..."}`
   - `scroll_containers` → `{"status":"ok","offset":N,"total":M}`（不在 monitor 页时回 error，同 Python）
   - 未知 action / 畸形 JSON → `{"status":"error","message":...}`，listener 不中断
 - screenshot：锁 fb → 克隆 `Vec<u16>` → 解锁 → RGB565 转 RGB888 编码 PNG。编码在锁外，不阻塞渲染帧。
@@ -147,7 +176,13 @@ loop {
 - **变化驱动重绘**：删除一切 blanket `mark_dirty`；静止画面每秒 SPI 写入量必须远小于全屏。
 - 质量保障：baseline 恒定单测、measure/draw 一致性单测、Label 值不变零脏区单测、headless 黄金图对比测试。
 
-### 4.8 字体渲染质量风险
+### 4.8 图表控件（2026-08-01 新增）
+
+- `LineChart`：固定量程（如温度 20–90°C、CPU/MEM 0–100%）或自动量程（IO 类，nice_ceil）。
+- 数据不变零操作；变化时先擦背景（图表矩形）再画网格/阈值线/折线，脏区 = 图表矩形。
+- 双序列支持（net up/down、disk read/write），颜色走语义常量。
+
+### 4.9 字体渲染质量风险
 
 - 小字号观感若仍逊于 PIL，回退预渲染位图字体（只改 text.rs，不动架构）。
 
@@ -157,10 +192,10 @@ loop {
 |---|---|---|
 | `config.py` | `config.rs` | 颜色/渐变/间隔/设备列表常量 |
 | `render.py` / `fonts.py` | `fb.rs` + `render.rs` + `text.rs` + `label.rs` | RGB565 转换合并进绘制路径；文本引擎与字段控件 |
-| `monitor_mode.py` | `pages/monitor.rs` | 布局、容器分页滚动逐条复刻 |
-| `metrics.py` | `metrics.rs` | CPU 平滑算法复刻；慢通道异步化 |
+| `monitor_mode.py` | `pages/monitor.rs` | v4 主页 + 电源弹窗 |
+| `metrics.py` | `metrics.rs` | CPU 平滑算法复刻；IO 文件解析；History 缓冲 |
 | `touch.py` | `touch.rs` | 裸解析 input_event，语义逐条对齐 |
-| `ipc_server.py` | `ipc.rs` + `screenshot.rs` | 协议逐字段对齐 |
+| `ipc_server.py` | `ipc.rs` + `screenshot.rs` | 协议逐字段对齐；mode 集合扩展为 6 个 |
 | `panel.py` | `pages/mod.rs`（PageManager） | 模式框架 → Page 抽象 |
 | `console_mode.py` | — | 删除，不迁移 |
 
@@ -168,6 +203,7 @@ loop {
 
 - 二进制安装到 `/usr/local/bin/pi-dashboard-rust`，修改现有 `pi-dashboard.service` 的 `ExecStart`（保留 `StateDirectory=pi-dashboard`、`Restart=always`），修改前备份到 `~/pi_dashboard/backups/`。
 - Python 包保留作为回退，回退 = 恢复 ExecStart + 重启服务。
+- v4 起详情页由触摸/IPC 进入，无需 MCP 改动。
 
 ## 7. 评审决议（原“待评审问题”已关闭）
 
