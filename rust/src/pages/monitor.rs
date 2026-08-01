@@ -248,132 +248,72 @@ struct NetCard {
     x: i32,
     y: i32,
     net_text_width: i32,
-    label_text: Label,
-    up_rate: Label,
-    down_rate: Label,
     last_up: String,
     last_down: String,
-    last_up_bbox: Option<Rect>,
-    last_down_bbox: Option<Rect>,
 }
 
 impl NetCard {
     fn new(x: i32, y: i32, fonts: &Fonts) -> Self {
         let label_style = TextStyle::new(11, GRAY, false).with_weight(FontWeight::Regular);
-        let value_style = TextStyle::new(16, WHITE, false);
         let net_text_width = fonts.measure("NET", &label_style) as i32;
         Self {
             x,
             y,
             net_text_width,
-            label_text: Label::new(x + 8, y + 3, label_style, Align::Left, PANEL, fonts),
-            up_rate: Label::new(0, y + 3, label_style, Align::Left, PANEL, fonts),
-            down_rate: Label::new(0, y + 19, value_style, Align::Left, PANEL, fonts),
             last_up: String::new(),
             last_down: String::new(),
-            last_up_bbox: None,
-            last_down_bbox: None,
         }
     }
 
-    fn draw_static(&mut self, fb: &mut Framebuffer, fonts: &Fonts) {
+    fn draw_static(&self, fb: &mut Framebuffer, fonts: &Fonts) {
         HeroCard::draw_card_background(fb, self.x, self.y);
-        self.label_text.force_draw(fb, fonts, "NET");
+        let label_style = TextStyle::new(11, GRAY, false).with_weight(FontWeight::Regular);
+        let baseline_y = fonts.baseline_y(self.y + 3, &label_style);
+        fonts.draw(fb, "NET", self.x + 8, baseline_y, &label_style);
     }
 
     fn set(&mut self, fb: &mut Framebuffer, fonts: &Fonts, up: f32, down: f32) {
         let up_str = fmt_rate(up);
         let down_str = fmt_rate(down);
-
-        let label_off = self.x + 8 + self.net_text_width + NET_UP_TREND_W + 3;
-        self.up_rate.set_x(label_off);
-
-        let down_off = self.x + 8 + NET_DOWN_TREND_W + 3;
-        self.down_rate.set_x(down_off);
-
-        if up_str != self.last_up {
-            self.erase_up(fb);
-            self.draw_up_arrow(fb);
-            self.up_rate.force_draw(fb, fonts, &up_str);
-            self.last_up = up_str;
-            self.last_up_bbox = Some(self.up_bbox());
+        if up_str == self.last_up && down_str == self.last_down {
+            return;
         }
 
-        if down_str != self.last_down {
-            self.erase_down(fb);
-            self.draw_down_arrow(fb);
-            self.down_rate.force_draw(fb, fonts, &down_str);
-            self.last_down = down_str;
-            self.last_down_bbox = Some(self.down_bbox());
-        }
-    }
+        // Erase the whole card and redraw everything atomically. The card is
+        // only 108×40 px and updates at 1 Hz; this guarantees no residue when
+        // values shorten.
+        fill_rect(fb, self.x + 1, self.y + 1, HERO_CARD_W - 2, HERO_CARD_H - 2, PANEL);
+        self.draw_static(fb, fonts);
 
-    fn erase_up(&mut self, fb: &mut Framebuffer) {
-        let x = self.up_arrow_x();
-        let bbox = Rect::new(
-            x as usize,
-            (self.y + 3) as usize,
-            (x + NET_UP_TREND_W + 60) as usize,
-            (self.y + 3 + NET_UP_TREND_H + 4) as usize,
-        );
-        fill_rect(fb, bbox.x1 as i32, bbox.y1 as i32, bbox.width() as i32, bbox.height() as i32, PANEL);
-        if let Some(last) = self.last_up_bbox {
-            fill_rect(fb, last.x1 as i32, last.y1 as i32, last.width() as i32, last.height() as i32, PANEL);
-        }
-    }
+        let label_style = TextStyle::new(11, GRAY, false).with_weight(FontWeight::Regular);
+        let value_style = TextStyle::new(16, WHITE, false);
 
-    fn erase_down(&mut self, fb: &mut Framebuffer) {
-        let x = self.down_arrow_x();
-        let bbox = Rect::new(
-            x as usize,
-            (self.y + 19) as usize,
-            (x + NET_DOWN_TREND_W + 80) as usize,
-            (self.y + 19 + NET_DOWN_TREND_H + 4) as usize,
-        );
-        fill_rect(fb, bbox.x1 as i32, bbox.y1 as i32, bbox.width() as i32, bbox.height() as i32, PANEL);
-        if let Some(last) = self.last_down_bbox {
-            fill_rect(fb, last.x1 as i32, last.y1 as i32, last.width() as i32, last.height() as i32, PANEL);
-        }
-    }
+        // Up arrow + up rate.
+        let up_arrow_x = self.x + 8 + self.net_text_width + 2 + NET_UP_TREND_W / 2;
+        let up_arrow_y = self.y + 3 + NET_UP_TREND_H / 2;
+        fill_triangle(fb, up_arrow_x, up_arrow_y, NET_UP_TREND_W, NET_UP_TREND_H, true, GRAY);
+        let up_text_x = up_arrow_x + NET_UP_TREND_W / 2 + 2;
+        let up_baseline_y = fonts.baseline_y(self.y + 3, &label_style);
+        fonts.draw(fb, &up_str, up_text_x, up_baseline_y, &label_style);
 
-    fn up_arrow_x(&self) -> i32 {
-        self.x + 8 + self.net_text_width + 2 + NET_UP_TREND_W / 2
-    }
+        // Down arrow + down rate.
+        let down_arrow_x = self.x + 8 + NET_DOWN_TREND_W / 2;
+        let down_arrow_y = self.y + 19 + NET_DOWN_TREND_H / 2;
+        fill_triangle(fb, down_arrow_x, down_arrow_y, NET_DOWN_TREND_W, NET_DOWN_TREND_H, false, CYAN);
+        let down_text_x = down_arrow_x + NET_DOWN_TREND_W / 2 + 2;
+        let down_baseline_y = fonts.baseline_y(self.y + 19, &value_style);
+        fonts.draw(fb, &down_str, down_text_x, down_baseline_y, &value_style);
 
-    fn down_arrow_x(&self) -> i32 {
-        self.x + 8 + NET_DOWN_TREND_W / 2
-    }
+        // Mark the card interior dirty.
+        fb.mark_dirty(Rect::new(
+            (self.x + 1) as usize,
+            (self.y + 1) as usize,
+            (self.x + HERO_CARD_W - 1) as usize,
+            (self.y + HERO_CARD_H - 1) as usize,
+        ));
 
-    fn draw_up_arrow(&self, fb: &mut Framebuffer) {
-        let cx = self.up_arrow_x();
-        let cy = self.y + 3 + NET_UP_TREND_H / 2;
-        fill_triangle(fb, cx, cy, NET_UP_TREND_W, NET_UP_TREND_H, true, GRAY);
-    }
-
-    fn draw_down_arrow(&self, fb: &mut Framebuffer) {
-        let cx = self.down_arrow_x();
-        let cy = self.y + 19 + NET_DOWN_TREND_H / 2;
-        fill_triangle(fb, cx, cy, NET_DOWN_TREND_W, NET_DOWN_TREND_H, false, CYAN);
-    }
-
-    fn up_bbox(&self) -> Rect {
-        let ax = self.up_arrow_x() - NET_UP_TREND_W / 2;
-        Rect::new(
-            ax.max(0) as usize,
-            (self.y + 3).max(0) as usize,
-            (ax + NET_UP_TREND_W + 60).max(0) as usize,
-            (self.y + 3 + NET_UP_TREND_H + 4).max(0) as usize,
-        )
-    }
-
-    fn down_bbox(&self) -> Rect {
-        let ax = self.down_arrow_x() - NET_DOWN_TREND_W / 2;
-        Rect::new(
-            ax.max(0) as usize,
-            (self.y + 19).max(0) as usize,
-            (ax + NET_DOWN_TREND_W + 80).max(0) as usize,
-            (self.y + 19 + NET_DOWN_TREND_H + 4).max(0) as usize,
-        )
+        self.last_up = up_str;
+        self.last_down = down_str;
     }
 }
 
