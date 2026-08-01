@@ -64,7 +64,7 @@ impl BackButton {
     }
 
     pub fn hit(&self, ev: &TouchEvent) -> bool {
-        ev.pressed
+        ev.is_activate()
             && ev.x >= self.bbox.x1 as i32
             && ev.x < self.bbox.x2 as i32
             && ev.y >= self.bbox.y1 as i32

@@ -100,6 +100,7 @@ pub const DOCKER_LIST_Y: i32 = 176;
 pub const DOCKER_LINE_HEIGHT: i32 = 14;
 
 pub const TOUCH_DEVICES: &[&str] = &[
+    "/dev/input/touchscreen-fixed",
     "/dev/input/event1",
     "/dev/input/event0",
     "/dev/input/event2",

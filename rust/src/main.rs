@@ -39,8 +39,6 @@ mod screenshot;
 mod text;
 mod touch;
 
-const FRAME_INTERVAL_MS: u64 = 100;
-
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     tracing_subscriber::fmt()
@@ -89,7 +87,7 @@ async fn main() {
     let (ipc_tx, mut ipc_rx) = mpsc::channel::<IpcCommand>(16);
     IpcServer::new(fb.clone(), metrics.clone(), ipc_tx).start();
 
-    let mut ticker = interval(Duration::from_millis(FRAME_INTERVAL_MS));
+    let mut ticker = interval(Duration::from_millis(config::REFRESH_INTERVAL_MS));
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
     loop {

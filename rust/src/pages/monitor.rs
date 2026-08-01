@@ -24,7 +24,7 @@ use crate::render::{
     draw_line_h, fill_ellipse, fill_rect, fill_rounded_rect, fill_triangle,
 };
 use crate::text::{FontWeight, Fonts, TextStyle};
-use crate::touch::TouchEvent;
+use crate::touch::{TouchEvent, TouchKind};
 
 const TEMP_TREND_WINDOW_SECS: f32 = 60.0;
 const TEMP_TREND_COMPARE_SECS: f32 = 30.0;
@@ -359,7 +359,7 @@ impl TopButton {
     }
 
     fn hit(&self, ev: &TouchEvent) -> bool {
-        ev.pressed
+        ev.is_activate()
             && ev.x >= self.x
             && ev.x < self.x + self.w
             && ev.y >= self.y
@@ -488,6 +488,7 @@ pub struct MonitorPage {
 
     scroll_last_offset: usize,
     scroll_last_total: usize,
+    drag_accum_dy: i32,
 
     // Bottom bar
     footer_label: Label,
@@ -641,6 +642,7 @@ impl MonitorPage {
             container_rows,
             scroll_last_offset: usize::MAX,
             scroll_last_total: usize::MAX,
+            drag_accum_dy: 0,
             footer_label,
             load_label,
             fps_label,
@@ -1198,11 +1200,11 @@ impl MonitorPage {
     }
 
     fn hit_cancel_button(ev: &TouchEvent) -> bool {
-        ev.pressed && ev.x >= 110 && ev.x < 210 && ev.y >= 160 && ev.y < 192
+        matches!(ev.kind, TouchKind::Tap) && ev.x >= 110 && ev.x < 210 && ev.y >= 160 && ev.y < 192
     }
 
     fn hit_confirm_button(ev: &TouchEvent) -> bool {
-        ev.pressed && ev.x >= 270 && ev.x < 370 && ev.y >= 160 && ev.y < 192
+        matches!(ev.kind, TouchKind::Tap) && ev.x >= 270 && ev.x < 370 && ev.y >= 160 && ev.y < 192
     }
 }
 
@@ -1244,30 +1246,30 @@ impl Page for MonitorPage {
     }
 
     fn on_touch(&mut self, ev: TouchEvent) -> PageAction {
-        if !ev.pressed {
-            return PageAction::None;
-        }
-
         // Power dialog takes precedence.
-        match self.power_state {
-            PowerState::Confirming { action, .. } => {
-                if Self::hit_confirm_button(&ev) {
-                    self.execute_power(action);
+        if !matches!(self.power_state, PowerState::Idle) {
+            match self.power_state {
+                PowerState::Confirming { action, .. } => {
+                    if Self::hit_confirm_button(&ev) {
+                        self.execute_power(action);
+                        return PageAction::None;
+                    }
+                    if Self::hit_cancel_button(&ev) {
+                        self.cancel_power();
+                        return PageAction::None;
+                    }
+                    // Any other tap/drag/long-press outside the buttons cancels.
+                    if ev.is_activate() || matches!(ev.kind, TouchKind::Release) {
+                        self.cancel_power();
+                    }
                     return PageAction::None;
                 }
-                if Self::hit_cancel_button(&ev) {
-                    self.cancel_power();
+                PowerState::Executing { .. } | PowerState::Failed { .. } => {
+                    // Ignore touches while executing/failed.
                     return PageAction::None;
                 }
-                // Outside dialog = cancel.
-                self.cancel_power();
-                return PageAction::None;
+                PowerState::Idle => unreachable!(),
             }
-            PowerState::Executing { .. } | PowerState::Failed { .. } => {
-                // Ignore touches while executing/failed.
-                return PageAction::None;
-            }
-            PowerState::Idle => {}
         }
 
         // Top bar buttons.
@@ -1283,9 +1285,37 @@ impl Page for MonitorPage {
             return PageAction::None;
         }
 
-        // Hero cards.
         let (x, y) = (ev.x, ev.y);
-        if y >= HERO_CARD_Y && y < HERO_CARD_Y + HERO_CARD_H {
+
+        // Docker list drag scroll.
+        if y >= DOCKER_LIST_Y && y < DOCKER_LIST_Y + CONTAINER_PAGE_SIZE as i32 * DOCKER_LINE_HEIGHT {
+            match ev.kind {
+                TouchKind::Drag { dy, .. } => {
+                    self.drag_accum_dy += dy;
+                    let threshold = DOCKER_LINE_HEIGHT / 2;
+                    if self.drag_accum_dy.abs() >= threshold {
+                        let lines = (self.drag_accum_dy / threshold).max(-5).min(5);
+                        if lines > 0 {
+                            self.container_scroll_offset = self.container_scroll_offset.saturating_add(lines as usize);
+                        } else {
+                            self.container_scroll_offset = self.container_scroll_offset.saturating_sub((-lines) as usize);
+                        }
+                        self.drag_accum_dy = 0;
+                    }
+                    return PageAction::None;
+                }
+                TouchKind::Tap => {
+                    // A tap in the list area scrolls one line (legacy behaviour,
+                    // but now gated on a clean tap instead of every ABS event).
+                    self.container_scroll_offset += 1;
+                    return PageAction::None;
+                }
+                _ => return PageAction::None,
+            }
+        }
+
+        // Hero cards (tap only).
+        if ev.is_activate() && y >= HERO_CARD_Y && y < HERO_CARD_Y + HERO_CARD_H {
             for (idx, card_x) in HERO_CARD_X.iter().enumerate() {
                 if x >= *card_x && x < *card_x + HERO_CARD_W {
                     return match idx {
@@ -1299,15 +1329,12 @@ impl Page for MonitorPage {
             }
         }
 
-        // CPU area.
-        let (cpu_x1, cpu_y1, cpu_x2, cpu_y2) = CPU_AREA;
-        if x >= cpu_x1 && x < cpu_x2 && y >= cpu_y1 && y < cpu_y2 {
-            return PageAction::Switch("cpu");
-        }
-
-        // Docker list scroll.
-        if y >= DOCKER_LIST_Y && y < DOCKER_LIST_Y + CONTAINER_PAGE_SIZE as i32 * DOCKER_LINE_HEIGHT {
-            self.container_scroll_offset += 1;
+        // CPU area (tap only).
+        if ev.is_activate() {
+            let (cpu_x1, cpu_y1, cpu_x2, cpu_y2) = CPU_AREA;
+            if x >= cpu_x1 && x < cpu_x2 && y >= cpu_y1 && y < cpu_y2 {
+                return PageAction::Switch("cpu");
+            }
         }
 
         PageAction::None
@@ -1323,6 +1350,7 @@ impl Page for MonitorPage {
         self.temp_trend_last_bbox = None;
         self.scroll_last_offset = usize::MAX;
         self.scroll_last_total = usize::MAX;
+        self.drag_accum_dy = 0;
         self.load_label.clear(fb);
         self.power_state = PowerState::Idle;
         self.power_result_rx = None;
@@ -1348,7 +1376,7 @@ mod tests {
     use super::*;
     use crate::pages::Page;
     use crate::text::Fonts;
-    use crate::touch::TouchEvent;
+    use crate::touch::{TouchEvent, TouchKind};
 
     fn make_page() -> MonitorPage {
         let fonts = Fonts::load().expect("fonts should load");
@@ -1358,7 +1386,7 @@ mod tests {
     #[test]
     fn touch_release_ignored() {
         let mut page = make_page();
-        let ev = TouchEvent { x: 100, y: 200, pressed: false, timestamp: 0.0 };
+        let ev = TouchEvent { x: 100, y: 200, kind: TouchKind::Release, timestamp_ms: 0 };
         assert_eq!(page.on_touch(ev), PageAction::None);
     }
 
@@ -1366,9 +1394,18 @@ mod tests {
     fn touch_container_list_increments_offset() {
         let mut page = make_page();
         let y = DOCKER_LIST_Y + 4;
-        let ev = TouchEvent { x: 10, y, pressed: true, timestamp: 0.0 };
+        let ev = TouchEvent { x: 10, y, kind: TouchKind::Tap, timestamp_ms: 0 };
         assert_eq!(page.on_touch(ev), PageAction::None);
         assert_eq!(page.container_scroll_offset, 1);
+    }
+
+    #[test]
+    fn touch_container_list_drag_scrolls() {
+        let mut page = make_page();
+        let y = DOCKER_LIST_Y + 4;
+        let ev = TouchEvent { x: 10, y, kind: TouchKind::Drag { dx: 0, dy: 20 }, timestamp_ms: 0 };
+        assert_eq!(page.on_touch(ev), PageAction::None);
+        assert!(page.container_scroll_offset > 0);
     }
 
     #[test]
@@ -1377,8 +1414,8 @@ mod tests {
         let ev = TouchEvent {
             x: HERO_CARD_X[0] + 10,
             y: HERO_CARD_Y + 10,
-            pressed: true,
-            timestamp: 0.0,
+            kind: TouchKind::Tap,
+            timestamp_ms: 0,
         };
         assert_eq!(page.on_touch(ev), PageAction::Switch("temp"));
     }
@@ -1386,7 +1423,7 @@ mod tests {
     #[test]
     fn touch_cpu_area_switches_cpu_page() {
         let mut page = make_page();
-        let ev = TouchEvent { x: 100, y: 100, pressed: true, timestamp: 0.0 };
+        let ev = TouchEvent { x: 100, y: 100, kind: TouchKind::Tap, timestamp_ms: 0 };
         assert_eq!(page.on_touch(ev), PageAction::Switch("cpu"));
     }
 
@@ -1396,8 +1433,8 @@ mod tests {
         let ev = TouchEvent {
             x: MENU_CHIP_X + 5,
             y: MENU_CHIP_Y + 5,
-            pressed: true,
-            timestamp: 0.0,
+            kind: TouchKind::Tap,
+            timestamp_ms: 0,
         };
         assert_eq!(page.on_touch(ev), PageAction::None);
     }
@@ -1461,8 +1498,8 @@ mod tests {
         let ev = TouchEvent {
             x: PWR_CHIP_X + 5,
             y: PWR_CHIP_Y + 5,
-            pressed: true,
-            timestamp: 0.0,
+            kind: TouchKind::Tap,
+            timestamp_ms: 0,
         };
         assert_eq!(page.on_touch(ev), PageAction::None);
         assert!(
@@ -1477,8 +1514,8 @@ mod tests {
         let ev = TouchEvent {
             x: RST_CHIP_X + 5,
             y: RST_CHIP_Y + 5,
-            pressed: true,
-            timestamp: 0.0,
+            kind: TouchKind::Tap,
+            timestamp_ms: 0,
         };
         assert_eq!(page.on_touch(ev), PageAction::None);
         assert!(
@@ -1494,8 +1531,8 @@ mod tests {
         let ev = TouchEvent {
             x: 155, // inside CANCEL button
             y: 175,
-            pressed: true,
-            timestamp: 0.0,
+            kind: TouchKind::Tap,
+            timestamp_ms: 0,
         };
         assert_eq!(page.on_touch(ev), PageAction::None);
         assert!(matches!(page.power_state, PowerState::Idle));
@@ -1509,8 +1546,8 @@ mod tests {
         let ev = TouchEvent {
             x: 50,
             y: 50,
-            pressed: true,
-            timestamp: 0.0,
+            kind: TouchKind::Tap,
+            timestamp_ms: 0,
         };
         assert_eq!(page.on_touch(ev), PageAction::None);
         assert!(matches!(page.power_state, PowerState::Idle));
@@ -1525,8 +1562,8 @@ mod tests {
         let confirm = TouchEvent {
             x: 320, // inside CONFIRM button
             y: 175,
-            pressed: true,
-            timestamp: 0.0,
+            kind: TouchKind::Tap,
+            timestamp_ms: 0,
         };
         assert_eq!(page.on_touch(confirm), PageAction::None);
         assert!(matches!(page.power_state, PowerState::Executing { .. }));
