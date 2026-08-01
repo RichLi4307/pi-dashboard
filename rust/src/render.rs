@@ -95,6 +95,57 @@ pub fn fill_rect(fb: &mut Framebuffer, x: i32, y: i32, w: i32, h: i32, color: u3
     }
 }
 
+/// Bresenham line. Only changed pixels are marked dirty.
+pub fn draw_line(fb: &mut Framebuffer, x1: i32, y1: i32, x2: i32, y2: i32, color: u32) {
+    if x1 == x2 && y1 == y2 {
+        return;
+    }
+    let rgb565 = rgb888_to_rgb565(color);
+    let dx = (x2 - x1).abs();
+    let dy = (y2 - y1).abs();
+    let sx = if x1 < x2 { 1 } else { -1 };
+    let sy = if y1 < y2 { 1 } else { -1 };
+    let mut err = dx - dy;
+    let mut x = x1;
+    let mut y = y1;
+
+    let dirty_x1 = x1.min(x2).max(0) as usize;
+    let dirty_y1 = y1.min(y2).max(0) as usize;
+    let mut dirty_x2 = x1.max(x2).max(0) as usize + 1;
+    let mut dirty_y2 = y1.max(y2).max(0) as usize + 1;
+    let mut changed = false;
+
+    loop {
+        if x >= 0 && x < W as i32 && y >= 0 && y < H as i32 {
+            let idx = y as usize * W + x as usize;
+            if fb.buffer_mut()[idx] != rgb565 {
+                fb.buffer_mut()[idx] = rgb565;
+                changed = true;
+            }
+        }
+        if x == x2 && y == y2 {
+            break;
+        }
+        let e2 = 2 * err;
+        if e2 > -dy {
+            err -= dy;
+            x += sx;
+        }
+        if e2 < dx {
+            err += dx;
+            y += sy;
+        }
+    }
+
+    if changed {
+        dirty_x2 = dirty_x2.min(W);
+        dirty_y2 = dirty_y2.min(H);
+        if dirty_x1 < dirty_x2 && dirty_y1 < dirty_y2 {
+            fb.mark_dirty(Rect::new(dirty_x1, dirty_y1, dirty_x2, dirty_y2));
+        }
+    }
+}
+
 /// Draw a horizontal line.
 pub fn draw_line_h(fb: &mut Framebuffer, x1: i32, x2: i32, y: i32, color: u32) {
     if y < 0 || y >= H as i32 {
@@ -237,6 +288,24 @@ mod tests {
 
     fn setup() -> Framebuffer {
         Framebuffer::headless()
+    }
+
+    #[test]
+    fn bresenham_line_marks_dirty() {
+        let mut fb = setup();
+        draw_line(&mut fb, 10, 10, 30, 20, 0xffffff);
+        let r = fb.dirty_rects();
+        assert!(!r.is_empty());
+        let union = r.iter().fold(r[0], |a, b| a.union(b));
+        assert!(union.width() >= 20);
+        assert!(union.height() >= 10);
+    }
+
+    #[test]
+    fn bresenham_line_zero_length_no_dirty() {
+        let mut fb = setup();
+        draw_line(&mut fb, 10, 10, 10, 10, 0xffffff);
+        assert!(fb.dirty_rects().is_empty());
     }
 
     #[test]

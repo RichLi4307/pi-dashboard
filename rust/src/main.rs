@@ -17,11 +17,17 @@ use tracing::{info, warn};
 use crate::fb::Framebuffer;
 use crate::ipc::{IpcCommand, IpcServer};
 use crate::metrics::Metrics;
+use crate::pages::cpu::CpuPage;
+use crate::pages::disk::DiskPage;
+use crate::pages::mem::MemPage;
 use crate::pages::monitor::MonitorPage;
+use crate::pages::net::NetPage;
+use crate::pages::temp::TempPage;
 use crate::pages::PageManager;
 use crate::text::{draw_boot_screen, Fonts};
 use crate::touch::TouchEvent;
 
+mod chart;
 mod config;
 mod fb;
 mod ipc;
@@ -67,6 +73,11 @@ async fn main() {
 
     let mut pages = PageManager::new();
     pages.register(Box::new(MonitorPage::new(fonts.clone())));
+    pages.register(Box::new(TempPage::new(fonts.clone())));
+    pages.register(Box::new(CpuPage::new(fonts.clone())));
+    pages.register(Box::new(MemPage::new(fonts.clone())));
+    pages.register(Box::new(DiskPage::new(fonts.clone())));
+    pages.register(Box::new(NetPage::new(fonts.clone())));
     {
         let mut guard = fb.lock().unwrap();
         pages.switch("monitor", &mut *guard);
@@ -110,6 +121,12 @@ async fn main() {
                     let _ = respond.send(result);
                 }
             }
+        }
+
+        // Auto-return detail pages to monitor after inactivity.
+        if let crate::pages::PageAction::Switch(home) = pages.check_idle_timeout() {
+            let mut guard = fb.lock().unwrap();
+            pages.switch(home, &mut *guard);
         }
 
         // Build snapshot for this frame.

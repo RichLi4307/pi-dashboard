@@ -146,6 +146,11 @@ impl Label {
         self.baseline_y
     }
 
+    /// Direct access to the text style for external measurement alignment.
+    pub fn style(&self) -> &TextStyle {
+        &self.style
+    }
+
     /// The bounding box of the currently displayed text, if any.
     pub fn bbox(&self) -> Option<Rect> {
         self.last_bbox

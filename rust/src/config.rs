@@ -87,6 +87,7 @@ pub const SLOW_RENDER_INTERVAL: f32 = 1.0;
 pub const SLOW_DATA_INTERVAL: f32 = 5.0;
 pub const CPU_SMOOTH_WINDOW: usize = 5;  // shorter smoothing at higher FPS; jumps + avg coexist
 pub const BOOT_TIMEOUT: u64 = 30;
+pub const HISTORY_CAPACITY: usize = 120; // 1 Hz × 120 samples ≈ 2 minutes
 
 pub const MODE_NAMES: &[&str] = &["monitor"];
 

@@ -15,7 +15,7 @@ use tokio::time::{interval, timeout};
 use tracing::{debug, warn};
 
 use crate::config::{
-    CPU_SMOOTH_WINDOW, IP_FILTER_ENABLED, SLOW_DATA_INTERVAL,
+    parse_percent, parse_temp, CPU_SMOOTH_WINDOW, HISTORY_CAPACITY, IP_FILTER_ENABLED,
 };
 
 #[derive(Clone, Default, Debug)]
@@ -163,9 +163,35 @@ pub struct MetricsSnapshot {
     pub tailscale: String,
     pub containers: Vec<ContainerInfo>,
     pub disk: String,
-    pub temp: String,
     pub mem: String,
+    pub temp: String,
     pub cpu: Vec<(String, f32)>,
+    /// Instant IO rates, refreshed at 1 Hz by the metrics background task.
+    pub io: IoSnapshot,
+    /// Historical samples for charts (1 Hz, capacity HISTORY_CAPACITY).
+    pub history: HistorySnapshot,
+}
+
+/// Instantaneous network/disk IO rates (bytes/sec).
+#[derive(Clone, Default, Debug)]
+pub struct IoSnapshot {
+    pub net_down: f32,
+    pub net_up: f32,
+    pub disk_read: f32,
+    pub disk_write: f32,
+}
+
+/// Historical chart samples (1 Hz, capacity HISTORY_CAPACITY).
+#[derive(Clone, Default, Debug)]
+pub struct HistorySnapshot {
+    pub temp: Vec<f32>,
+    pub cpu_total: Vec<f32>,
+    pub mem_pct: Vec<f32>,
+    pub disk_pct: Vec<f32>,
+    pub net_down: Vec<f32>,
+    pub net_up: Vec<f32>,
+    pub disk_read: Vec<f32>,
+    pub disk_write: Vec<f32>,
 }
 
 /// CPU usage sampler with sliding-window smoothing.
@@ -270,6 +296,49 @@ impl CpuSampler {
     }
 }
 
+fn read_cpu_total() -> f32 {
+    let text = match std::fs::read_to_string("/proc/stat") {
+        Ok(t) => t,
+        Err(_) => return 0.0,
+    };
+    static LAST_CPU: std::sync::Mutex<Option<(std::time::Instant, u64, u64)>> = std::sync::Mutex::new(None);
+    for line in text.lines() {
+        if !line.starts_with("cpu ") {
+            continue;
+        }
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() < 5 {
+            return 0.0;
+        }
+        let values: Vec<u64> = parts[1..]
+            .iter()
+            .filter_map(|s| s.parse::<u64>().ok())
+            .collect();
+        if values.len() < 4 {
+            return 0.0;
+        }
+        let total: u64 = values.iter().sum();
+        let idle = values[3] + values.get(4).copied().unwrap_or(0);
+        let now = std::time::Instant::now();
+        let mut guard = LAST_CPU.lock().unwrap_or_else(|e| e.into_inner());
+        let pct = if let Some((prev_t, p_total, p_idle)) = *guard {
+            let _dt = now.duration_since(prev_t).as_micros() as f64;
+            let du_total = total.saturating_sub(p_total) as f64;
+            let du_idle = idle.saturating_sub(p_idle) as f64;
+            if du_total > 0.0 {
+                (100.0 * (1.0 - du_idle / du_total)) as f32
+            } else {
+                0.0
+            }
+        } else {
+            0.0
+        };
+        *guard = Some((now, total, idle));
+        return pct.clamp(0.0, 100.0);
+    }
+    0.0
+}
+
 pub fn read_cpu_temp() -> String {
     match std::fs::read_to_string("/sys/class/thermal/thermal_zone0/temp") {
         Ok(text) => match text.trim().parse::<i64>() {
@@ -310,6 +379,180 @@ pub fn read_mem_info() -> String {
     let used = total.saturating_sub(available);
     let pct = 100.0 * used as f32 / total as f32;
     format!("{}/{:.0}MB ({:.0}%)", used / 1024, total as f32 / 1024.0, pct)
+}
+
+/// Format a byte-per-second rate into a compact human-readable string.
+/// <1024 -> "812B"; <10240 -> "1.0K"; <1M -> "12K"; else "1.2M".
+pub fn fmt_rate(bps: f32) -> String {
+    let bps = bps.abs();
+    if bps < 1024.0 {
+        format!("{:.0}B", bps)
+    } else if bps < 10.0 * 1024.0 {
+        format!("{:.1}K", bps / 1024.0)
+    } else if bps < 1024.0 * 1024.0 {
+        format!("{:.0}K", bps / 1024.0)
+    } else {
+        format!("{:.1}M", bps / (1024.0 * 1024.0))
+    }
+}
+
+/// Round a positive value up to a "nice" grid max: 1/2/5 × 10ⁿ.
+pub fn nice_ceil(value: f32) -> f32 {
+    if value <= 0.0 || !value.is_finite() {
+        return 1.0;
+    }
+    let value = value as f64;
+    let exp = value.log10().floor() as i32;
+    let base = 10_f64.powi(exp);
+    let mantissa = value / base;
+    let nice = if mantissa <= 1.0 {
+        1.0
+    } else if mantissa <= 2.0 {
+        2.0
+    } else if mantissa <= 5.0 {
+        5.0
+    } else {
+        10.0
+    };
+    ((nice * base) as f32).max(1.0)
+}
+
+/// Parse /proc/net/dev and return the total (received, transmitted) bytes.
+/// Aggregates all non-loopback physical interfaces.
+pub fn read_net_bytes() -> Option<(u64, u64)> {
+    let text = std::fs::read_to_string("/proc/net/dev").ok()?;
+    let mut rx = 0u64;
+    let mut tx = 0u64;
+    for line in text.lines().skip(2) {
+        let Some((iface, rest)) = line.split_once(':') else {
+            continue;
+        };
+        let iface = iface.trim();
+        if iface == "lo" || iface.starts_with("docker") || iface.starts_with("veth") || iface.starts_with("br-") {
+            continue;
+        }
+        let cols: Vec<&str> = rest.split_whitespace().collect();
+        if cols.len() < 9 {
+            continue;
+        }
+        if let Some((r, t)) = cols[0].parse::<u64>().ok().zip(cols[8].parse::<u64>().ok()) {
+            rx += r;
+            tx += t;
+        }
+    }
+    Some((rx, tx))
+}
+
+/// Parse /proc/diskstats and return the total read/write sectors for the
+/// primary block device (mmcblk0). Sectors are 512 bytes.
+pub fn read_disk_sectors() -> Option<(u64, u64)> {
+    let text = std::fs::read_to_string("/proc/diskstats").ok()?;
+    for line in text.lines() {
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        if cols.len() < 14 {
+            continue;
+        }
+        if cols[2] == "mmcblk0" {
+            let read = cols[5].parse::<u64>().ok()?;
+            let write = cols[9].parse::<u64>().ok()?;
+            return Some((read, write));
+        }
+    }
+    None
+}
+
+/// Holds the previous raw counters and computes instant IO rates.
+#[derive(Default)]
+struct IoSampler {
+    last_net: Option<(std::time::Instant, u64, u64)>,
+    last_disk: Option<(std::time::Instant, u64, u64)>,
+}
+
+impl IoSampler {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn sample(&mut self) -> IoSnapshot {
+        let now = std::time::Instant::now();
+        let mut io = IoSnapshot::default();
+
+        if let Some((rx, tx)) = read_net_bytes() {
+            if let Some((prev_t, prev_rx, prev_tx)) = self.last_net {
+                let dt = now.duration_since(prev_t).as_secs_f32();
+                if dt > 0.0 {
+                    io.net_down = ((rx.saturating_sub(prev_rx)) as f32 / dt).max(0.0);
+                    io.net_up = ((tx.saturating_sub(prev_tx)) as f32 / dt).max(0.0);
+                }
+            }
+            self.last_net = Some((now, rx, tx));
+        }
+
+        if let Some((read, write)) = read_disk_sectors() {
+            if let Some((prev_t, prev_r, prev_w)) = self.last_disk {
+                let dt = now.duration_since(prev_t).as_secs_f32();
+                if dt > 0.0 {
+                    const SECTOR: f32 = 512.0;
+                    io.disk_read = ((read.saturating_sub(prev_r)) as f32 * SECTOR / dt).max(0.0);
+                    io.disk_write = ((write.saturating_sub(prev_w)) as f32 * SECTOR / dt).max(0.0);
+                }
+            }
+            self.last_disk = Some((now, read, write));
+        }
+
+        io
+    }
+}
+
+/// 1 Hz ring buffer for chart history. Eight sequences, capacity 120 each.
+#[derive(Default)]
+pub struct History {
+    temp: VecDeque<f32>,
+    cpu_total: VecDeque<f32>,
+    mem_pct: VecDeque<f32>,
+    disk_pct: VecDeque<f32>,
+    net_down: VecDeque<f32>,
+    net_up: VecDeque<f32>,
+    disk_read: VecDeque<f32>,
+    disk_write: VecDeque<f32>,
+}
+
+impl History {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn push(&mut self, temp: f32, cpu_total: f32, mem_pct: f32, disk_pct: f32, io: &IoSnapshot) {
+        let cap = HISTORY_CAPACITY;
+        push_sample(&mut self.temp, temp, cap);
+        push_sample(&mut self.cpu_total, cpu_total, cap);
+        push_sample(&mut self.mem_pct, mem_pct, cap);
+        push_sample(&mut self.disk_pct, disk_pct, cap);
+        push_sample(&mut self.net_down, io.net_down, cap);
+        push_sample(&mut self.net_up, io.net_up, cap);
+        push_sample(&mut self.disk_read, io.disk_read, cap);
+        push_sample(&mut self.disk_write, io.disk_write, cap);
+    }
+
+    fn snapshot(&self) -> HistorySnapshot {
+        HistorySnapshot {
+            temp: self.temp.iter().copied().collect(),
+            cpu_total: self.cpu_total.iter().copied().collect(),
+            mem_pct: self.mem_pct.iter().copied().collect(),
+            disk_pct: self.disk_pct.iter().copied().collect(),
+            net_down: self.net_down.iter().copied().collect(),
+            net_up: self.net_up.iter().copied().collect(),
+            disk_read: self.disk_read.iter().copied().collect(),
+            disk_write: self.disk_write.iter().copied().collect(),
+        }
+    }
+}
+
+fn push_sample(q: &mut VecDeque<f32>, value: f32, cap: usize) {
+    q.push_back(value);
+    while q.len() > cap {
+        q.pop_front();
+    }
 }
 
 async fn read_disk_usage() -> String {
@@ -444,17 +687,40 @@ impl Metrics {
         let (tx, rx) = watch::channel(MetricsSnapshot::default());
 
         tokio::spawn(async move {
-            let mut ticker = interval(Duration::from_secs_f32(SLOW_DATA_INTERVAL));
+            // Single 1 Hz loop: IO + history every tick, slow data every 5 ticks.
+            let mut ticker = interval(Duration::from_secs_f32(1.0));
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-
-            // First refresh immediately.
-            let mut snap = Self::refresh_slow(&MetricsSnapshot::default()).await;
-            let _ = tx.send(snap.clone());
+            let mut io_sampler = IoSampler::new();
+            let mut history = History::new();
+            let mut snap = MetricsSnapshot::default();
+            let mut tick_count = 0u32;
 
             loop {
                 ticker.tick().await;
-                snap = Self::refresh_slow(&snap).await;
+
+                let io = io_sampler.sample();
+                let temp_val = parse_temp(&read_cpu_temp()).unwrap_or(0) as f32;
+                let cpu_total = read_cpu_total();
+                let mem_pct = parse_percent(&read_mem_info()).unwrap_or(0) as f32;
+                let disk_pct = parse_percent(&snap.disk).unwrap_or(0) as f32;
+                history.push(temp_val, cpu_total, mem_pct, disk_pct, &io);
+
+                if tick_count % 5 == 0 {
+                    let (ips, tailscale, containers, disk) = tokio::join!(
+                        get_ip_list(),
+                        read_tailscale_status(),
+                        read_docker_containers_with_cpu(&snap.containers),
+                        read_disk_usage(),
+                    );
+                    snap.ips = ips;
+                    snap.tailscale = tailscale;
+                    snap.containers = containers;
+                    snap.disk = disk;
+                }
+                snap.io = io;
+                snap.history = history.snapshot();
                 let _ = tx.send(snap.clone());
+                tick_count += 1;
             }
         });
 
@@ -464,22 +730,9 @@ impl Metrics {
         }
     }
 
-    async fn refresh_slow(prev: &MetricsSnapshot) -> MetricsSnapshot {
-        let (ips, tailscale, containers, disk) = tokio::join!(
-            get_ip_list(),
-            read_tailscale_status(),
-            read_docker_containers_with_cpu(&prev.containers),
-            read_disk_usage(),
-        );
-        MetricsSnapshot {
-            ips,
-            tailscale,
-            containers,
-            disk,
-            temp: String::new(),
-            mem: String::new(),
-            cpu: Vec::new(),
-        }
+    fn refresh_slow(_prev: &MetricsSnapshot) -> MetricsSnapshot {
+        // Kept for compatibility; the background loop now handles refresh internally.
+        MetricsSnapshot::default()
     }
 
     pub fn snapshot(&self) -> MetricsSnapshot {
@@ -585,5 +838,29 @@ mod tests {
         assert_eq!(abbreviate_status("Created"), "New");
         assert_eq!(abbreviate_status("Paused"), "Paus");
         assert_eq!(abbreviate_status("Unknown weird state"), "Unknown weird state");
+    }
+
+    #[test]
+    fn fmt_rate_boundaries() {
+        assert_eq!(fmt_rate(0.0), "0B");
+        assert_eq!(fmt_rate(1023.0), "1023B");
+        assert_eq!(fmt_rate(1024.0), "1.0K");
+        assert_eq!(fmt_rate(10240.0 - 1.0), "10.0K");
+        assert_eq!(fmt_rate(10240.0), "10K");
+        assert_eq!(fmt_rate(1024.0 * 1024.0), "1.0M");
+        assert_eq!(fmt_rate(1.5 * 1024.0 * 1024.0), "1.5M");
+    }
+
+    #[test]
+    fn nice_ceil_rounds_to_125_grid() {
+        assert_eq!(nice_ceil(0.0), 1.0);
+        assert_eq!(nice_ceil(0.4), 1.0);
+        assert_eq!(nice_ceil(1.2), 2.0);
+        assert_eq!(nice_ceil(2.6), 5.0);
+        assert_eq!(nice_ceil(6.0), 10.0);
+        assert_eq!(nice_ceil(12.0), 20.0);
+        assert_eq!(nice_ceil(120.0), 200.0);
+        assert_eq!(nice_ceil(500.0), 500.0);
+        assert_eq!(nice_ceil(800.0), 1000.0);
     }
 }

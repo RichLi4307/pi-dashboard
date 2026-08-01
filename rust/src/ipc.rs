@@ -166,10 +166,11 @@ impl IpcServer {
             .get("mode")
             .and_then(|v| v.as_str())
             .unwrap_or("monitor");
-        if mode != "monitor" {
+        const VALID_MODES: &[&'static str] = &["monitor", "temp", "cpu", "mem", "disk", "net"];
+        let Some(&mode_static) = VALID_MODES.iter().find(|&&m| m == mode) else {
             return error(format!("unknown mode: {mode}"));
-        }
-        if let Err(e) = self.control_tx.send(IpcCommand::SwitchMode("monitor")).await {
+        };
+        if let Err(e) = self.control_tx.send(IpcCommand::SwitchMode(mode_static)).await {
             return error(format!("control channel closed: {e}"));
         }
         ok(json!({"mode": mode}))
